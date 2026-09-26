@@ -1,4 +1,4 @@
-from .model import (
+from .resunetpp import (
     ResUNetPP3DMultiHead,
     ResUNetPPDecoder3D,
     StemBlock3D,

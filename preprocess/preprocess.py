@@ -129,7 +129,7 @@ def generate_yaml_from_folders(
     output_yaml: str = "preprocess/dataset_split.yaml",
 ) -> dict:
     if num_classes_by_source is None:
-        num_classes_by_source = {"2ch": 3, "4ch": 5, "sa": 4}
+        num_classes_by_source = {"2ch": 3, "4ch": 6, "sa": 4}
 
     splits, counts = scan_prepartitioned_folders(
         data_root=data_root,
