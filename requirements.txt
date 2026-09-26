@@ -1,0 +1,29 @@
+# ==============================================================================
+# MultiCMR Dependencies (Python 3.10)
+# ==============================================================================
+
+# --- Deep Learning Framework ---
+# Note: For CUDA-accelerated PyTorch, please install via:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118 (or cu121)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# --- Medical Image Processing & I/O ---
+nibabel>=5.0.0              # Read and write 3D NIfTI (.nii, .nii.gz) files
+SimpleITK>=2.2.0            # Medical image spacing, resampling, and registration
+
+# --- Scientific Computing & Data Analysis ---
+numpy>=1.23.5,<2.0.0        # Compatible with PyTorch 2.x and SciPy stack
+scipy>=1.10.0               # Morphological operations, distance transforms, mode statistics
+pandas>=2.0.0               # Metric tables, CSV/Excel logging and data manipulation
+scikit-learn>=1.2.0         # Metric evaluation, confusion matrix, ROC curves
+
+# --- Configuration & Utilities ---
+pyyaml>=6.0                 # YAML parsing and dataset split management
+tqdm>=4.65.0                # Progress bar display
+
+# --- Image Processing & Visualization (Plotting) ---
+matplotlib>=3.7.0           # Loss curves, Dice progression, multi-slice visual plots
+seaborn>=0.12.0             # Statistical charts, metric boxplots, violin plots, heatmaps
+opencv-python>=4.7.0        # RGB slice overlay generation, canvas concatenations
+Pillow>=9.5.0               # Python imaging library for image save/load

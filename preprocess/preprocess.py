@@ -4,9 +4,28 @@ import os
 from glob import glob
 from typing import Dict, List, Sequence, Tuple
 import yaml
-import numpy as np
 
 NII_EXTENSIONS = (".nii", ".nii.gz")
+
+# Exact folder mapping:
+# 2ch -> 2CH_TR, 2CH_VAL, 2CH_TST
+# 4ch -> 4CH_TR, 4CH_VAL, 4CH_TST
+# sa  -> SAX_TR, SAX_VAL, SAX_TST
+SOURCE_PREFIX_MAP = {
+    "2ch": "2CH",
+    "4ch": "4CH",
+    "sa": "SAX",
+    "sax": "SAX",
+    "2CH": "2CH",
+    "4CH": "4CH",
+    "SAX": "SAX",
+}
+
+SPLIT_SUFFIX_MAP = {
+    "train": "_TR",
+    "val": "_VAL",
+    "test": "_TST",
+}
 
 
 def _strip_nii_suffix(name: str) -> str:
@@ -17,204 +36,171 @@ def _strip_nii_suffix(name: str) -> str:
     return name
 
 
-def collect_dataset_records(
-    data_root: str,
-    source_names: Sequence[str],
-    image_dirname: str = "image",
-    label_dirname: str = "seg",
-) -> Tuple[List[dict], List[str]]:
-    """Scan dataset and return paired records with unique case IDs."""
-    records = []
-    case_ids_set = set()
-
-    for source_id, source in enumerate(source_names):
-        source_root = os.path.join(data_root, source)
-        image_root = os.path.join(source_root, image_dirname)
-        label_root = os.path.join(source_root, label_dirname)
-
-        if not os.path.isdir(image_root) or not os.path.isdir(label_root):
-            print(f"Warning: Directory not found for source {source}: {image_root} or {label_root}")
-            continue
-
-        image_paths = []
-        label_paths = []
-        for extension in NII_EXTENSIONS:
-            image_paths.extend(glob(os.path.join(image_root, "**", f"*{extension}"), recursive=True))
-            label_paths.extend(glob(os.path.join(label_root, "**", f"*{extension}"), recursive=True))
-
-        image_map = {_strip_nii_suffix(os.path.basename(path)): path for path in sorted(image_paths)}
-        label_map = {_strip_nii_suffix(os.path.basename(path)): path for path in sorted(label_paths)}
-
-        shared_names = sorted(set(image_map) & set(label_map))
-        for name in shared_names:
-            img_p = os.path.relpath(image_map[name], data_root)
-            lbl_p = os.path.relpath(label_map[name], data_root)
-            records.append({
-                "case_id": name,
-                "source": source,
-                "source_id": source_id,
-                "image_path": img_p,
-                "label_path": lbl_p,
-            })
-            case_ids_set.add(name)
-
-    return records, sorted(list(case_ids_set))
+def find_subfolder(parent_dir: str, candidates: Sequence[str]) -> str:
+    for name in candidates:
+        p = os.path.join(parent_dir, name)
+        if os.path.isdir(p):
+            return name
+    return ""
 
 
-def split_case_ids(
-    case_ids: List[str],
-    split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1),
-    seed: int = 42,
-) -> Dict[str, List[str]]:
-    """Patient-level split (Train : Val : Test) to prevent data leakage."""
-    r_train, r_val, r_test = split_ratio
-    total_ratio = r_train + r_val + r_test
-    r_train, r_val, r_test = r_train / total_ratio, r_val / total_ratio, r_test / total_ratio
-
-    rng = np.random.default_rng(seed)
-    shuffled_ids = list(case_ids)
-    rng.shuffle(shuffled_ids)
-
-    n_total = len(shuffled_ids)
-    if n_total == 0:
-        return {"train": [], "val": [], "test": []}
-
-    n_train = int(round(n_total * r_train))
-    n_val = int(round(n_total * r_val))
-    # Ensure train + val + test == n_total
-    n_test = n_total - n_train - n_val
-
-    # Edge cases handling
-    if n_total >= 3:
-        if n_val == 0:
-            n_val = 1
-            n_train = max(1, n_train - 1)
-        if n_test == 0:
-            n_test = 1
-            n_train = max(1, n_train - 1)
-
-    train_ids = shuffled_ids[:n_train]
-    val_ids = shuffled_ids[n_train:n_train + n_val]
-    test_ids = shuffled_ids[n_train + n_val:]
-
-    return {
-        "train": sorted(train_ids),
-        "val": sorted(val_ids),
-        "test": sorted(test_ids),
-    }
-
-
-def load_id_mapping(mapping_path: str) -> Dict[str, int]:
-    if not mapping_path or not os.path.exists(mapping_path):
-        return {}
-    with open(mapping_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {str(k): int(v) for k, v in data.items()}
-
-
-def create_dataset_split_yaml(
+def scan_prepartitioned_folders(
     data_root: str,
     source_order: Sequence[str] = ("2ch", "4ch", "sa"),
-    image_dirname: str = "image",
-    label_dirname: str = "seg",
-    split_ratio: Tuple[float, float, float] = (0.8, 0.1, 0.1),
+    image_dirnames: Sequence[str] = ("image", "images"),
+    label_dirnames: Sequence[str] = ("anno", "seg", "label", "labels"),
+) -> Tuple[Dict[str, List[dict]], Dict[str, int]]:
+    """
+    Scans predefined directories:
+      - Train: 2CH_TR, 4CH_TR, SAX_TR (requires image/ and anno/)
+      - Val:   2CH_VAL, 4CH_VAL, SAX_VAL (requires image/ and anno/)
+      - Test:  2CH_TST, 4CH_TST, SAX_TST (only requires image/, no anno/)
+    """
+    splits = {"train": [], "val": [], "test": []}
+
+    for source_id, source in enumerate(source_order):
+        prefix = SOURCE_PREFIX_MAP.get(source, source.upper())
+
+        for split_key, split_suffix in SPLIT_SUFFIX_MAP.items():
+            folder_name = f"{prefix}{split_suffix}"
+            folder_abs = os.path.join(data_root, folder_name)
+
+            if not os.path.isdir(folder_abs):
+                print(f"[Warning] Folder not found: {folder_abs}")
+                continue
+
+            img_dir = find_subfolder(folder_abs, image_dirnames)
+            lbl_dir = find_subfolder(folder_abs, label_dirnames)
+
+            if not img_dir:
+                print(f"[Warning] Missing image subfolder in {folder_abs}")
+                continue
+
+            if split_key in ("train", "val") and not lbl_dir:
+                print(f"[Warning] Missing annotation subfolder (anno/) in {folder_abs}")
+                continue
+
+            img_abs = os.path.join(folder_abs, img_dir)
+            img_files = []
+            for ext in NII_EXTENSIONS:
+                img_files.extend(glob(os.path.join(img_abs, f"*{ext}")))
+            img_map = {_strip_nii_suffix(os.path.basename(p)): p for p in sorted(img_files)}
+
+            if lbl_dir:
+                lbl_abs = os.path.join(folder_abs, lbl_dir)
+                lbl_files = []
+                for ext in NII_EXTENSIONS:
+                    lbl_files.extend(glob(os.path.join(lbl_abs, f"*{ext}")))
+                lbl_map = {_strip_nii_suffix(os.path.basename(p)): p for p in sorted(lbl_files)}
+
+                paired_cases = sorted(set(img_map.keys()) & set(lbl_map.keys()))
+                for case_id in paired_cases:
+                    rel_img = os.path.relpath(img_map[case_id], data_root)
+                    rel_lbl = os.path.relpath(lbl_map[case_id], data_root)
+                    splits[split_key].append({
+                        "case_id": case_id,
+                        "source": source,
+                        "source_id": source_id,
+                        "folder": folder_name,
+                        "image_path": rel_img,
+                        "label_path": rel_lbl,
+                    })
+            else:
+                # Test set without annotations (_TST): image only
+                for case_id, img_p in img_map.items():
+                    rel_img = os.path.relpath(img_p, data_root)
+                    splits[split_key].append({
+                        "case_id": case_id,
+                        "source": source,
+                        "source_id": source_id,
+                        "folder": folder_name,
+                        "image_path": rel_img,
+                        "label_path": "",
+                    })
+
+    counts = {k: len(v) for k, v in splits.items()}
+    return splits, counts
+
+
+def generate_yaml_from_folders(
+    data_root: str,
+    source_order: Sequence[str] = ("2ch", "4ch", "sa"),
     num_classes_by_source: Dict[str, int] = None,
-    id_mapping_path: str = "",
     output_yaml: str = "preprocess/dataset_split.yaml",
-    seed: int = 42,
 ) -> dict:
     if num_classes_by_source is None:
         num_classes_by_source = {"2ch": 3, "4ch": 5, "sa": 4}
 
-    records, unique_case_ids = collect_dataset_records(
+    splits, counts = scan_prepartitioned_folders(
         data_root=data_root,
-        source_names=source_order,
-        image_dirname=image_dirname,
-        label_dirname=label_dirname,
+        source_order=source_order,
     )
-
-    id_splits = split_case_ids(unique_case_ids, split_ratio=split_ratio, seed=seed)
-    train_set = set(id_splits["train"])
-    val_set = set(id_splits["val"])
-    test_set = set(id_splits["test"])
-
-    splits_data = {"train": [], "val": [], "test": []}
-    for rec in records:
-        cid = rec["case_id"]
-        if cid in train_set:
-            splits_data["train"].append(rec)
-        elif cid in val_set:
-            splits_data["val"].append(rec)
-        elif cid in test_set:
-            splits_data["test"].append(rec)
-
-    # Load existing id_mapping
-    id_mapping = load_id_mapping(id_mapping_path)
 
     yaml_data = {
         "dataset_info": {
-            "data_root": os.path.abspath(data_root),
+            "data_root": os.path.abspath(data_root) if data_root else "",
             "source_order": list(source_order),
             "num_classes_by_source": num_classes_by_source,
-            "split_ratio": {
-                "train": float(split_ratio[0]),
-                "val": float(split_ratio[1]),
-                "test": float(split_ratio[2]),
-            },
-            "case_counts": {
-                "total": len(unique_case_ids),
-                "train": len(id_splits["train"]),
-                "val": len(id_splits["val"]),
-                "test": len(id_splits["test"]),
-            },
             "sample_counts": {
-                "total": len(records),
-                "train": len(splits_data["train"]),
-                "val": len(splits_data["val"]),
-                "test": len(splits_data["test"]),
+                "total": sum(counts.values()),
+                "train": counts["train"],
+                "val": counts["val"],
+                "test": counts["test"],
             },
         },
-        "id_mapping": id_mapping,
-        "split_case_ids": id_splits,
-        "splits": splits_data,
+        "splits": splits,
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(output_yaml)), exist_ok=True)
     with open(output_yaml, "w", encoding="utf-8") as f:
         yaml.dump(yaml_data, f, sort_keys=False, allow_unicode=True, indent=2)
 
-    print(f"[Preprocess] Successfully generated dataset split YAML at: {output_yaml}")
-    print(f"  - Total unique cases: {len(unique_case_ids)} (Train: {len(id_splits['train'])}, Val: {len(id_splits['val'])}, Test: {len(id_splits['test'])})")
-    print(f"  - Total sample volumes: {len(records)} (Train: {len(splits_data['train'])}, Val: {len(splits_data['val'])}, Test: {len(splits_data['test'])})")
-    print(f"  - Integrated id_mapping entries: {len(id_mapping)}")
+    print(f"\n[Preprocess] Successfully scanned folders and generated YAML at: {output_yaml}")
+    print(f"  - Data Root: {os.path.abspath(data_root)}")
+    print(f"  - Sources: {list(source_order)}")
+    print(f"  - Folders Scanned: 2CH_TR/VAL/TST, 4CH_TR/VAL/TST, SAX_TR/VAL/TST")
+    print(f"  - Total Samples: {sum(counts.values())} (Train: {counts['train']}, Val: {counts['val']}, Test: {counts['test']})")
+    print(f"  - Test set mode: Image only (no anno/ required)\n")
     return yaml_data
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MultiCMR Preprocess: Split dataset (8:1:1) and save YAML with id_mapping")
-    parser.add_argument("--data-root", type=str, required=True, help="Root folder containing sequence subdirectories")
-    parser.add_argument("--source-order", nargs="+", default=["2ch", "4ch", "sa"], help="List of sequence sources")
-    parser.add_argument("--image-dirname", type=str, default="image", help="Subdirectory name for images")
-    parser.add_argument("--label-dirname", type=str, default="seg", help="Subdirectory name for labels")
-    parser.add_argument("--split-ratio", nargs=3, type=float, default=[0.8, 0.1, 0.1], help="Train:Val:Test ratio (e.g. 0.8 0.1 0.1)")
-    parser.add_argument("--num-classes-json", type=str, default='{"2ch":3,"4ch":5,"sa":4}', help="Classes count per sequence")
-    parser.add_argument("--id-mapping", type=str, default="rawdata/id_mapping.json", help="Path to input id_mapping.json to merge")
-    parser.add_argument("--output-yaml", type=str, default="preprocess/dataset_split.yaml", help="Path to output YAML file")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic split")
+    parser = argparse.ArgumentParser(
+        description="MultiCMR: Scan 2CH_TR/VAL/TST, 4CH_TR/VAL/TST, SAX_TR/VAL/TST folders and generate YAML"
+    )
+    parser.add_argument(
+        "--data-root",
+        type=str,
+        required=True,
+        help="Root folder containing 2CH_TR, 2CH_VAL, 2CH_TST, 4CH_*, SAX_* folders",
+    )
+    parser.add_argument(
+        "--source-order",
+        nargs="+",
+        default=["2ch", "4ch", "sa"],
+        help="Sequence source keys to include (default: 2ch 4ch sa)",
+    )
+    parser.add_argument(
+        "--num-classes-json",
+        type=str,
+        default='{"2ch":3,"4ch":6,"sa":4}',
+        help="JSON string specifying number of classes per source",
+    )
+    parser.add_argument(
+        "--output-yaml",
+        type=str,
+        default="preprocess/dataset_split.yaml",
+        help="Path where output YAML file will be saved (default: preprocess/dataset_split.yaml)",
+    )
     args = parser.parse_args()
 
     num_classes = json.loads(args.num_classes_json) if args.num_classes_json else {"2ch": 3, "4ch": 5, "sa": 4}
 
-    create_dataset_split_yaml(
+    generate_yaml_from_folders(
         data_root=args.data_root,
         source_order=args.source_order,
-        image_dirname=args.image_dirname,
-        label_dirname=args.label_dirname,
-        split_ratio=tuple(args.split_ratio),
         num_classes_by_source=num_classes,
-        id_mapping_path=args.id_mapping,
         output_yaml=args.output_yaml,
-        seed=args.seed,
     )
 
 
