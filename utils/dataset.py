@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from glob import glob
 from typing import Dict, List, Sequence, Tuple
-
+import yaml
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -113,7 +113,63 @@ def collect_cases(
                     label_path=label_map[name],
                 )
             )
+
     return cases
+
+
+def load_cases_from_yaml(
+    yaml_path: str,
+    split: str = "train",
+    data_root_override: str = None,
+) -> Tuple[List[CaseItem], dict]:
+    """
+    Load CaseItem list from preprocessed YAML file.
+    Supports split in (train, val, test, all).
+    """
+    if not os.path.exists(yaml_path):
+        raise FileNotFoundError(f"Dataset split YAML not found: {yaml_path}")
+
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    dataset_info = data.get("dataset_info", {})
+    id_mapping = data.get("id_mapping", {})
+    root = data_root_override or dataset_info.get("data_root", "")
+
+    splits_dict = data.get("splits", {})
+    if split == "all":
+        records = splits_dict.get("train", []) + splits_dict.get("val", []) + splits_dict.get("test", [])
+    elif split in splits_dict:
+        records = splits_dict[split]
+    else:
+        raise KeyError(f"Split {split} not found in YAML. Available keys: {list(splits_dict.keys())}")
+
+    cases = []
+    for rec in records:
+        img_p = rec["image_path"]
+        lbl_p = rec["label_path"]
+        if not os.path.isabs(img_p) and root:
+            img_p = os.path.join(root, img_p)
+        if not os.path.isabs(lbl_p) and root:
+            lbl_p = os.path.join(root, lbl_p)
+
+        cases.append(
+            CaseItem(
+                source=rec["source"],
+                source_id=int(rec.get("source_id", 0)),
+                image_path=img_p,
+                label_path=lbl_p,
+            )
+        )
+
+    info = {
+        "source_order": dataset_info.get("source_order", ["2ch", "4ch", "sa"]),
+        "num_classes_by_source": dataset_info.get("num_classes_by_source", {"2ch": 3, "4ch": 5, "sa": 4}),
+        "id_mapping": id_mapping,
+        "split_case_ids": data.get("split_case_ids", {}),
+        "data_root": root,
+    }
+    return cases, info
 
 
 class MultiSourceNiftiDataset3D(Dataset):

@@ -1,5 +1,5 @@
 from .common import set_seed, create_dir, save_json, load_json, print_and_save
-from .dataset import MultiSourceNiftiDataset3D, collect_cases, split_cases_by_source
+from .dataset import MultiSourceNiftiDataset3D, collect_cases, split_cases_by_source, load_cases_from_yaml
 from .metrics import (
     DiceCELoss,
     dice_ce_loss,
@@ -19,6 +19,7 @@ __all__ = [
     "MultiSourceNiftiDataset3D",
     "collect_cases",
     "split_cases_by_source",
+    "load_cases_from_yaml",
     "DiceCELoss",
     "dice_ce_loss",
     "multiclass_dice_iou",

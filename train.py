@@ -17,6 +17,7 @@ from utils import (
     MultiSourceNiftiDataset3D,
     collect_cases,
     dice_ce_loss,
+    load_cases_from_yaml,
     multiclass_dice_iou,
     set_seed,
     split_cases_by_source,
@@ -155,23 +156,24 @@ def run_one_epoch(
 
 def main():
     parser = argparse.ArgumentParser(description="Train 3D ResUNet++ multi-head on multi-sequence CMR NIfTI")
-    parser.add_argument("--data-root", type=str, required=True, help="Root folder containing sequence subdirectories")
+    parser.add_argument("--data-root", type=str, default="", help="Root folder containing sequence subdirectories")
+    parser.add_argument("--split-yaml", type=str, default="preprocess/dataset_split.yaml", help="Path to preprocessed split YAML")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Directory to save checkpoints and logs")
-    parser.add_argument("--source-order", nargs="+", default=["2ch", "4ch", "sa"], help="List of sequence sources")
+    parser.add_argument("--source-order", nargs="+", default=None, help="List of sequence sources (defaults to YAML or [2ch 4ch sa])")
     parser.add_argument("--image-dirname", type=str, default="image", help="Subdirectory name for images")
     parser.add_argument("--label-dirname", type=str, default="seg", help="Subdirectory name for segmentation labels")
     parser.add_argument(
         "--num-classes-json",
         type=str,
-        default='{"2ch":3,"4ch":5,"sa":4}',
-        help="JSON string specifying number of classes per source",
+        default=None,
+        help="JSON string specifying number of classes per source (defaults to YAML)",
     )
     parser.add_argument("--input-size", nargs=3, type=int, default=[64, 160, 160], help="Target volume size (D, H, W)")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--epochs", type=int, default=200, help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio")
+    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio if split-yaml is not used")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
         "--device",
@@ -194,23 +196,37 @@ def main():
         print(f"[MultiCMR] Running in {'Distributed (DDP, World Size=' + str(world_size) + ')' if is_distributed else 'Single-GPU/CPU'} mode")
         print(f"[MultiCMR] Master rank using device: {device}")
 
-    num_classes_by_source = parse_num_classes(args.num_classes_json)
-
-    all_cases = collect_cases(
-        data_root=args.data_root,
-        source_names=args.source_order,
-        image_dirname=args.image_dirname,
-        label_dirname=args.label_dirname,
-    )
-    train_cases, val_cases = split_cases_by_source(
-        all_cases,
-        source_names=args.source_order,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-    )
+    # Case 1: Load from Split YAML
+    if args.split_yaml and os.path.exists(args.split_yaml):
+        if is_master_proc(rank):
+            print(f"[MultiCMR] Loading dataset split from YAML: {args.split_yaml}")
+        train_cases, info = load_cases_from_yaml(args.split_yaml, split="train", data_root_override=args.data_root or None)
+        val_cases, _ = load_cases_from_yaml(args.split_yaml, split="val", data_root_override=args.data_root or None)
+        source_order = args.source_order or info["source_order"]
+        num_classes_by_source = parse_num_classes(args.num_classes_json) if args.num_classes_json else info["num_classes_by_source"]
+    else:
+        # Case 2: Direct scan from data_root
+        if not args.data_root:
+            raise ValueError(f"Neither valid --split-yaml nor --data-root was provided! Missing: {args.split_yaml}")
+        source_order = args.source_order or ["2ch", "4ch", "sa"]
+        num_classes_by_source = parse_num_classes(args.num_classes_json)
+        all_cases = collect_cases(
+            data_root=args.data_root,
+            source_names=source_order,
+            image_dirname=args.image_dirname,
+            label_dirname=args.label_dirname,
+        )
+        train_cases, val_cases = split_cases_by_source(
+            all_cases,
+            source_names=source_order,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
 
     if is_master_proc(rank):
-        print(f"Total cases: {len(all_cases)}, train: {len(train_cases)}, val: {len(val_cases)}")
+        print(f"[MultiCMR] Cases: Train={len(train_cases)}, Val={len(val_cases)}")
+        print(f"[MultiCMR] Source Order: {source_order}")
+        print(f"[MultiCMR] Num Classes: {num_classes_by_source}")
 
     train_dataset = MultiSourceNiftiDataset3D(
         cases=train_cases,
@@ -251,7 +267,7 @@ def main():
 
     model = ResUNetPP3DMultiHead(
         in_channels=1,
-        source_order=args.source_order,
+        source_order=source_order,
         num_classes_by_source=num_classes_by_source,
     ).to(device)
 
@@ -285,7 +301,7 @@ def main():
             loader=train_loader,
             optimizer=optimizer,
             device=device,
-            source_order=args.source_order,
+            source_order=source_order,
             num_classes_by_source=num_classes_by_source,
             is_train=True,
             is_distributed=is_distributed,
@@ -297,7 +313,7 @@ def main():
             loader=val_loader,
             optimizer=optimizer,
             device=device,
-            source_order=args.source_order,
+            source_order=source_order,
             num_classes_by_source=num_classes_by_source,
             is_train=False,
             is_distributed=is_distributed,
@@ -306,7 +322,7 @@ def main():
 
         scheduler.step(val_loss)
 
-        val_dice_values = [val_stats[src]["dice"] for src in args.source_order]
+        val_dice_values = [val_stats[src]["dice"] for src in source_order]
         mean_val_dice = float(np.mean(val_dice_values)) if val_dice_values else 0.0
 
         if is_master_proc(rank):
@@ -316,7 +332,7 @@ def main():
                 torch.save(
                     {
                         "model": raw_model.state_dict(),
-                        "source_order": args.source_order,
+                        "source_order": source_order,
                         "num_classes_by_source": num_classes_by_source,
                         "input_size": args.input_size,
                     },
@@ -328,7 +344,7 @@ def main():
                 f"Epoch {epoch:03d} | {elapsed:.1f}s | "
                 f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} mean_val_dice={mean_val_dice:.4f}\n"
             )
-            for src in args.source_order:
+            for src in source_order:
                 line += (
                     f"  {src}: train_dice={train_stats[src]['dice']:.4f}, train_iou={train_stats[src]['iou']:.4f}, "
                     f"val_dice={val_stats[src]['dice']:.4f}, val_iou={val_stats[src]['iou']:.4f}\n"
