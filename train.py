@@ -492,7 +492,7 @@ def main():
         help="JSON string specifying number of classes per source (defaults to YAML)",
     )
     parser.add_argument("--input-size", nargs=3, type=int, default=[64, 160, 160], help="Target volume size (D, H, W)")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--epochs", type=int, default=200, help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -608,7 +608,7 @@ def main():
     )
 
     model = ResUNetPP3DMultiHead(
-        in_channels=3,
+        in_channels=1,
         source_order=source_order,
         num_classes_by_source=num_classes_by_source,
     ).to(device)

@@ -6,133 +6,107 @@ import torch.nn.functional as F
 
 
 class AnatomyGraphTransformer(nn.Module):
-
-    def __init__(self, feature_dim=256, num_nodes=8, heads=8, layers=2):
-
+    def __init__(
+        self,
+        feature_dim: int = 256,
+        num_patches_per_view: int = 8,
+        num_anatomy_nodes: int = 5,
+        heads: int = 8,
+        layers: int = 2,
+    ):
         super().__init__()
+        self.num_patches = num_patches_per_view
+        self.num_anatomy = num_anatomy_nodes
+        self.total_nodes = 3 * num_patches_per_view + num_anatomy_nodes
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=feature_dim,
             nhead=heads,
             batch_first=True,
             norm_first=True,
+            dropout=0.1,
         )
 
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
-            num_layers=layers
+            num_layers=layers,
         )
 
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, num_nodes, feature_dim)
+        self.patch_pos_embedding = nn.Parameter(
+            torch.randn(1, 1, num_patches_per_view, feature_dim) * 0.02
+        )
+        self.anatomy_pos_embedding = nn.Parameter(
+            torch.randn(1, num_anatomy_nodes, feature_dim) * 0.02
         )
 
         self.register_buffer(
             "graph_mask",
-            self.build_graph_mask()
+            self.build_graph_mask(),
         )
-
 
     def build_graph_mask(self):
+        P = self.num_patches
+        N = self.total_nodes
+        A = torch.zeros(N, N)
 
-        A = torch.zeros(8, 8)
+        # 1. 视图内部 Patch 自连
+        for v in range(3):
+            A[v * P : (v + 1) * P, v * P : (v + 1) * P] = 1.0
 
+        # 2. 跨视图间 Patch 互通
+        view_view_pairs = [(0, 1), (0, 2), (1, 2)]
+        for v1, v2 in view_view_pairs:
+            A[v1 * P : (v1 + 1) * P, v2 * P : (v2 + 1) * P] = 1.0
+            A[v2 * P : (v2 + 1) * P, v1 * P : (v1 + 1) * P] = 1.0
 
-        # node definition:
-        #
-        # 0 : 2CH
-        # 1 : 4CH
-        # 2 : SA
-        #
-        # 3 : LV_myo
-        # 4 : LV_cav
-        # 5 : RV_cav
-        # 6 : RA
-        # 7 : LA
-
-
-        edges = [
-
-            # =====================
-            # view-view
-            # =====================
-            (0,1),    # 2CH - 4CH
-            (0,2),    # 2CH - SA
-            (1,2),    # 4CH - SA
-
-
-            # =====================
-            # 2CH anatomy
-            # =====================
-            (0,3),    # 2CH - LV_myo
-            (0,4),    # 2CH - LV_cav
-
-
-            # =====================
-            # 4CH anatomy
-            # =====================
-            (1,3),    # 4CH - LV_myo
-            (1,4),    # 4CH - LV_cav
-            (1,5),    # 4CH - RV_cav
-            (1,6),    # 4CH - RA
-            (1,7),    # 4CH - LA
-
-
-            # =====================
-            # SA anatomy
-            # =====================
-            (2,3),    # SA - LV_myo
-            (2,4),    # SA - LV_cav
-            (2,5),    # SA - RV_cav
-
+        # 3. 视图 Patch 与特定解剖先验 Token 交互
+        anat_offset = 3 * P
+        anatomy_view_mapping = [
+            (0, [0, 1, 2]),  # LV_myo <-> 2CH, 4CH, SA
+            (1, [0, 1, 2]),  # LV_cav <-> 2CH, 4CH, SA
+            (2, [1, 2]),     # RV_cav <-> 4CH, SA
+            (3, [1]),        # RA     <-> 4CH
+            (4, [1]),        # LA     <-> 4CH
         ]
 
+        for anat_idx, views in anatomy_view_mapping:
+            a_idx = anat_offset + anat_idx
+            for v in views:
+                A[v * P : (v + 1) * P, a_idx] = 1.0
+                A[a_idx, v * P : (v + 1) * P] = 1.0
 
-        for i,j in edges:
-            A[i,j]=1
-            A[j,i]=1
+        # 4. 解剖先验 Token 之间互通
+        A[anat_offset:, anat_offset:] = 1.0
 
+        # 5. 自连接
+        for i in range(N):
+            A[i, i] = 1.0
 
-        # self connection
-        for i in range(8):
-            A[i,i]=1
-
-
-        mask=torch.where(
-            A>0,
+        mask = torch.where(
+            A > 0,
             torch.tensor(0.0),
-            torch.tensor(float("-inf"))
+            torch.tensor(float("-inf")),
         )
-
-
         return mask
 
+    def forward(self, nodes):
+        P = self.num_patches
+        B, N, C = nodes.shape
 
+        patch_nodes = nodes[:, : 3 * P, :].view(B, 3, P, C)
+        patch_nodes = patch_nodes + self.patch_pos_embedding
+        patch_nodes = patch_nodes.view(B, 3 * P, C)
 
-    def forward(self,nodes):
+        anatomy_nodes = nodes[:, 3 * P :, :]
+        anatomy_nodes = anatomy_nodes + self.anatomy_pos_embedding
 
-        """
-        nodes:
-        [B,8,256]
-
-        index:
-        0 : 2CH
-        1 : 4CH
-        2 : SA
-
-        3 : LV_myo
-        4 : LV_cav
-        5 : RV_cav
-        6 : RA
-        7 : LA
-        """
-
-        nodes = nodes + self.pos_embedding
+        nodes = torch.cat([patch_nodes, anatomy_nodes], dim=1)
 
         return self.transformer(
             nodes,
-            mask=self.graph_mask
+            mask=self.graph_mask,
         )
+
 
 class SqueezeExcitation3D(nn.Module):
     def __init__(self, channels: int, reduction: int = 8) -> None:
@@ -275,25 +249,53 @@ class ResUNetPP3DMultiHead(nn.Module):
         super().__init__()
         self.source_order = list(source_order)
         self.num_classes_by_source = num_classes_by_source or {"2ch": 3, "4ch": 6, "sa": 4}
+
+        # Patch 3D 卷积映射配置
+        # 对应 Bottleneck 尺寸 (8, 20, 20)，经核大小与步长 (4, 10, 10) 卷积后得到 (2, 2, 2) 网格，P = 8
+        self.patch_size = (1, 1, 1)
+        self.patch_grid = (8, 20, 20)
+        self.num_patches = self.patch_grid[0] * self.patch_grid[1] * self.patch_grid[2]
+
         self.encoder = nn.ModuleDict({
-            "c1": StemBlock3D(1, 16, 1),
+            "c1": StemBlock3D(in_channels, 16, 1),
             "c2": ResBlock3D(16, 32, 2),
             "c3": ResBlock3D(32, 64, 2),
             "c4": ResBlock3D(64, 128, 2),
             "b": ASPP3D(128, 256),
         })
+
+        # Conv3d Patch Projection 层 (ViT 核心思想: 替代全局平均池化)
+        self.patch_proj = nn.Conv3d(
+            in_channels=256,
+            out_channels=256,
+            kernel_size=self.patch_size,
+            stride=self.patch_size,
+        )
+
         self.missing_tokens = nn.ParameterDict({
-            "2ch": nn.Parameter(torch.randn(256)),
-            "4ch": nn.Parameter(torch.randn(256)),
-            "sa": nn.Parameter(torch.randn(256)),
+            "2ch": nn.Parameter(torch.randn(self.num_patches, 256) * 0.02),
+            "4ch": nn.Parameter(torch.randn(self.num_patches, 256) * 0.02),
+            "sa": nn.Parameter(torch.randn(self.num_patches, 256) * 0.02),
         })
+
         self.modality_embedding = nn.ParameterDict({
-            "2ch": nn.Parameter(torch.randn(256)),
-            "4ch": nn.Parameter(torch.randn(256)),
-            "sa": nn.Parameter(torch.randn(256)),
+            "2ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
+            "4ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
+            "sa": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
         })
-        self.anatomy_tokens = nn.Parameter(torch.randn(5, 256))
-        self.graph = AnatomyGraphTransformer(feature_dim=256, num_nodes=8, heads=8, layers=2)
+
+        self.anatomy_tokens = nn.Parameter(torch.randn(5, 256) * 0.02)
+        self.graph = AnatomyGraphTransformer(
+            feature_dim=256,
+            num_patches_per_view=self.num_patches,
+            num_anatomy_nodes=5,
+            heads=8,
+            layers=2,
+        )
+
+        # 零初始化残差门控，保证训练平稳
+        self.gamma = nn.Parameter(torch.zeros(1))
+
         self.decoders = nn.ModuleDict()
         for src in self.source_order:
             self.decoders[src] = ResUNetPPDecoder3D(self.num_classes_by_source[src])
@@ -307,35 +309,54 @@ class ResUNetPP3DMultiHead(nn.Module):
         return s1, s2, s3, b
 
     def feature_to_token(self, b):
-        """b: [B,256,D,H,W] -> [B,256]"""
-        return F.adaptive_avg_pool3d(b, 1).flatten(1)
+        """
+        ViT Conv3d Patch Projection:
+        feature map [B, 256, D, H, W] -> Conv3d projection -> [B, 256, 2, 2, 2] -> [B, P=8, 256]
+        """
+        x_proj = self.patch_proj(b)
+        B, C, _, _, _ = x_proj.shape
+        return x_proj.view(B, C, -1).transpose(1, 2)
 
     def forward(self, x, modality_mask):
         """x: [B,3,D,H,W], modality_mask: [B,3]"""
         B = x.shape[0]
+        P = self.num_patches
         modality_features = []
         skips = {}
+
         for i, src in enumerate(self.source_order):
             present = modality_mask[:, i]
-            xi = x[:, i:i+1]
+            xi = x[:, i : i + 1]
             s1, s2, s3, b = self.encode(xi)
             skips[src] = (s1, s2, s3, b)
+
             token = self.feature_to_token(b)
             missing = (present == 0)
             if missing.any():
                 token = token.clone()
-                token[missing] = self.missing_tokens[src].unsqueeze(0).expand(missing.sum(), -1)
+                token[missing] = self.missing_tokens[src].unsqueeze(0).expand(missing.sum(), -1, -1)
+
             token = token + self.modality_embedding[src]
             modality_features.append(token)
-        modality_nodes = torch.stack(modality_features, dim=1)
+
+        modality_nodes = torch.cat(modality_features, dim=1)
         anatomy_nodes = self.anatomy_tokens.unsqueeze(0).expand(B, -1, -1)
+
         nodes = torch.cat([modality_nodes, anatomy_nodes], dim=1)
         graph_out = self.graph(nodes)
+
+        updated_patches = graph_out[:, : 3 * P, :].view(B, 3, P, 256)
+
         outputs = {}
         for i, src in enumerate(self.source_order):
             s1, s2, s3, b = skips[src]
-            graph_token = graph_out[:, i, :, None, None, None]
-            graph_token = graph_token.expand(-1, -1, b.shape[2], b.shape[3], b.shape[4])
-            b = b + graph_token
+            target_shape = b.shape[2:]
+
+            view_patches = updated_patches[:, i]
+            patch_feat = view_patches.transpose(1, 2).view(B, 256, *self.patch_grid)
+            graph_token = F.interpolate(patch_feat, size=target_shape, mode="trilinear", align_corners=False)
+
+            b = b + self.gamma * graph_token
             outputs[src] = self.decoders[src](s1, s2, s3, b)
+
         return {"logits": outputs, "graph_nodes": graph_out}
