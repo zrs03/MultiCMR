@@ -12,15 +12,14 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from models import ResUNetPP3DMultiHead
+from models import *
 from utils import (
     MultiSourceNiftiDataset3D,
-    collect_cases,
+    dice_ce_loss_per_sample,
     dice_ce_loss,
     load_cases_from_yaml,
     multiclass_dice_iou,
     set_seed,
-    split_cases_by_source,
 )
 
 
@@ -55,7 +54,58 @@ def reduce_tensor(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
 def parse_num_classes(config: str) -> Dict[str, int]:
     if config:
         return json.loads(config)
-    return {"2ch": 3, "4ch": 5, "sa": 4}
+    return {"2ch": 3, "4ch": 6, "sa": 4}
+
+def sample_modality_mask(
+    batch_size: int,
+    num_modalities: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Randomly sample a non-empty multi-hot modality mask.
+
+    For 3 modalities, possible masks are:
+
+        [1,0,0]
+        [0,1,0]
+        [0,0,1]
+        [1,1,0]
+        [1,0,1]
+        [0,1,1]
+        [1,1,1]
+
+    Returns:
+        mask: [B, num_modalities], float32
+    """
+
+    if num_modalities != 3:
+        raise ValueError(
+            "Current modality-mask sampling expects exactly "
+            "3 modalities: 2ch / 4ch / sa."
+        )
+
+    candidates = torch.tensor(
+        [
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1],
+            [1, 1, 0],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 1, 1],
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    indices = torch.randint(
+        low=0,
+        high=len(candidates),
+        size=(batch_size,),
+        device=device,
+    )
+
+    return candidates[indices]
 
 
 def get_model_core(model: torch.nn.Module) -> ResUNetPP3DMultiHead:
@@ -72,6 +122,7 @@ def run_one_epoch(
     source_order: list,
     num_classes_by_source: Dict[str, int],
     is_train: bool,
+    missing_modality_temperature: float = 1.0,
     is_distributed: bool = False,
     world_size: int = 1,
 ):
@@ -81,87 +132,359 @@ def run_one_epoch(
         model.eval()
 
     epoch_loss = 0.0
-    source_stats = defaultdict(lambda: {"dice": [], "iou": []})
-    raw_model = get_model_core(model)
+
+    source_stats = defaultdict(
+        lambda: {
+            "dice": [],
+            "iou": [],
+        }
+    )
 
     for batch in loader:
-        images = batch["image"].to(device, non_blocking=True)
-        masks = batch["mask"].to(device, non_blocking=True)
-        source_id = batch["source_id"].to(device, non_blocking=True)
+
+        # ========================================================
+        # 1. Input
+        # ========================================================
+
+        images = batch["image"].to(
+            device,
+            non_blocking=True,
+        )
+
+        # [B, 3, D, H, W]
+
+        if batch["masks"] is None:
+            raise RuntimeError(
+                "Training/validation requires annotations, "
+                "but dataset returned masks=None."
+            )
+
+        masks = {
+            source: batch["masks"][source].to(
+                device,
+                non_blocking=True,
+            )
+            for source in source_order
+        }
+
+        batch_size = images.shape[0]
+
+        # ========================================================
+        # 2. Modality mask
+        # ========================================================
+
+        if is_train:
+
+            # Random non-empty multi-hot mask
+            #
+            # [B, 3]
+            #
+            # Example:
+            #
+            # [1,0,1]
+            # [1,1,1]
+            # [0,1,0]
+
+            modality_mask = sample_modality_mask(
+                batch_size=batch_size,
+                num_modalities=len(source_order),
+                device=device,
+            )
+
+        else:
+
+            # Validation always uses all three modalities.
+            #
+            # [B,3] = [[1,1,1], ...]
+
+            modality_mask = torch.ones(
+                batch_size,
+                len(source_order),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        # ========================================================
+        # 3. Mask input modalities
+        # ========================================================
+
+        masked_images = (
+            images
+            * modality_mask[:, :, None, None, None]
+        )
+
+        # Shape:
+        #
+        # images:
+        #     [B,3,D,H,W]
+        #
+        # modality_mask:
+        #     [B,3]
+        #
+        # masked_images:
+        #     [B,3,D,H,W]
+
+        # ========================================================
+        # 4. Zero gradient
+        # ========================================================
 
         if is_train:
             optimizer.zero_grad()
 
-        batch_loss = 0.0
-        used_sources = 0
+        # ========================================================
+        # 5. Forward
+        # ========================================================
 
         with torch.set_grad_enabled(is_train):
-            for src_index, src_name in enumerate(source_order):
-                selected = source_id == src_index
-                if not torch.any(selected):
-                    continue
 
-                src_images = images[selected]
-                src_masks = masks[selected]
-                logits = raw_model.forward_source(src_images, src_name)
-                num_classes = num_classes_by_source[src_name]
+            outputs = model(
+                masked_images,
+                modality_mask,
+            )
 
-                if logits.shape[2:] != src_masks.shape[1:]:
-                    logits = F.interpolate(logits, size=src_masks.shape[1:], mode="trilinear", align_corners=False)
+            # outputs:
+            #
+            # {
+            #     "2ch": [B,3,D,H,W],
+            #     "4ch": [B,6,D,H,W],
+            #     "sa":  [B,4,D,H,W],
+            # }
 
-                loss = dice_ce_loss(logits, src_masks, num_classes)
-                batch_loss = batch_loss + loss
-                used_sources += 1
+            total_loss = 0.0
 
-                dice, iou = multiclass_dice_iou(logits, src_masks, num_classes)
-                source_stats[src_name]["dice"].append(float(dice.detach().cpu().item()))
-                source_stats[src_name]["iou"].append(float(iou.detach().cpu().item()))
+            # ====================================================
+            # 6. Calculate loss for each source
+            # ====================================================
 
-            if used_sources == 0:
-                continue
+            logits_dict = outputs["logits"]
 
-            batch_loss = batch_loss / used_sources
+            graph_nodes = outputs["graph_nodes"]
+            
+            for src_index, src_name in enumerate(
+                source_order
+            ):
+
+                logits = logits_dict[src_name]
+
+                target = masks[src_name]
+
+                num_classes = (
+                    num_classes_by_source[src_name]
+                )
+
+                # ------------------------------------------------
+                # Spatial alignment
+                # ------------------------------------------------
+
+                if logits.shape[2:] != target.shape[1:]:
+
+                    logits = F.interpolate(
+                        logits,
+                        size=target.shape[1:],
+                        mode="trilinear",
+                        align_corners=False,
+                    )
+
+                # ------------------------------------------------
+                # Per-sample Dice + CE
+                # ------------------------------------------------
+
+                loss_per_sample = (
+                    dice_ce_loss_per_sample(
+                        logits=logits,
+                        target=target,
+                        num_classes=num_classes,
+                    )
+                )
+
+                # ------------------------------------------------
+                # Temperature weighting
+                # ------------------------------------------------
+                #
+                # modality_mask[:, src_index]:
+                #
+                #     1 -> modality present
+                #     0 -> modality missing
+                #
+                # Therefore:
+                #
+                #     present -> weight 1
+                #     missing -> weight T
+                #
+
+                present = modality_mask[
+                    :, src_index
+                ]
+
+                loss_weight = (
+                    present
+                    + (
+                        1.0 - present
+                    )
+                    * missing_modality_temperature
+                )
+
+                # [B]
+
+                weighted_loss = (
+                    loss_per_sample
+                    * loss_weight
+                )
+
+                # [scalar]
+
+                source_loss = (
+                    weighted_loss.mean()
+                )
+
+                total_loss = (
+                    total_loss
+                    + source_loss
+                )
+
+                # ------------------------------------------------
+                # Metrics
+                # ------------------------------------------------
+
+                dice, iou = multiclass_dice_iou(
+                    logits,
+                    target,
+                    num_classes,
+                )
+
+                source_stats[src_name]["dice"].append(
+                    float(
+                        dice.detach()
+                        .cpu()
+                        .item()
+                    )
+                )
+
+                source_stats[src_name]["iou"].append(
+                    float(
+                        iou.detach()
+                        .cpu()
+                        .item()
+                    )
+                )
+
+            # ====================================================
+            # 7. Average three segmentation tasks
+            # ====================================================
+
+            batch_loss = (
+                total_loss
+                / len(source_order)
+            )
+
+            # ====================================================
+            # 8. Backward
+            # ====================================================
 
             if is_train:
+
                 batch_loss.backward()
+
                 optimizer.step()
 
-        loss_val = batch_loss.detach()
-        if is_distributed:
-            loss_val = reduce_tensor(loss_val, world_size)
-        epoch_loss += float(loss_val.cpu().item())
+        # ========================================================
+        # 9. Distributed loss
+        # ========================================================
 
-    num_steps = max(len(loader), 1)
-    epoch_loss = epoch_loss / num_steps
+        loss_val = batch_loss.detach()
+
+        if is_distributed:
+
+            loss_val = reduce_tensor(
+                loss_val,
+                world_size,
+            )
+
+        epoch_loss += float(
+            loss_val.cpu().item()
+        )
+
+    # ============================================================
+    # 10. Epoch average loss
+    # ============================================================
+
+    num_steps = max(
+        len(loader),
+        1,
+    )
+
+    epoch_loss /= num_steps
+
+    # ============================================================
+    # 11. Summarize metrics
+    # ============================================================
 
     summarized = {}
+
     for src in source_order:
-        dice_values = source_stats[src]["dice"]
-        iou_values = source_stats[src]["iou"]
-        mean_dice = float(np.mean(dice_values)) if dice_values else 0.0
-        mean_iou = float(np.mean(iou_values)) if iou_values else 0.0
+
+        dice_values = (
+            source_stats[src]["dice"]
+        )
+
+        iou_values = (
+            source_stats[src]["iou"]
+        )
+
+        mean_dice = (
+            float(np.mean(dice_values))
+            if dice_values
+            else 0.0
+        )
+
+        mean_iou = (
+            float(np.mean(iou_values))
+            if iou_values
+            else 0.0
+        )
 
         if is_distributed:
-            d_tensor = torch.tensor(mean_dice, device=device)
-            i_tensor = torch.tensor(mean_iou, device=device)
-            d_tensor = reduce_tensor(d_tensor, world_size)
-            i_tensor = reduce_tensor(i_tensor, world_size)
-            mean_dice = float(d_tensor.cpu().item())
-            mean_iou = float(i_tensor.cpu().item())
 
-        summarized[src] = {"dice": mean_dice, "iou": mean_iou}
+            d_tensor = torch.tensor(
+                mean_dice,
+                device=device,
+            )
+
+            i_tensor = torch.tensor(
+                mean_iou,
+                device=device,
+            )
+
+            d_tensor = reduce_tensor(
+                d_tensor,
+                world_size,
+            )
+
+            i_tensor = reduce_tensor(
+                i_tensor,
+                world_size,
+            )
+
+            mean_dice = float(
+                d_tensor.cpu().item()
+            )
+
+            mean_iou = float(
+                i_tensor.cpu().item()
+            )
+
+        summarized[src] = {
+            "dice": mean_dice,
+            "iou": mean_iou,
+        }
 
     return epoch_loss, summarized
 
-
 def main():
     parser = argparse.ArgumentParser(description="Train 3D ResUNet++ multi-head on multi-sequence CMR NIfTI")
-    parser.add_argument("--data-root", type=str, default="", help="Root folder containing sequence subdirectories")
-    parser.add_argument("--split-yaml", type=str, default="preprocess/dataset_split.yaml", help="Path to preprocessed split YAML")
+    parser.add_argument("--split-yaml", type=str, default="preprocess/matched.yaml", help="Path to preprocessed split YAML")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Directory to save checkpoints and logs")
     parser.add_argument("--source-order", nargs="+", default=None, help="List of sequence sources (defaults to YAML or [2ch 4ch sa])")
-    parser.add_argument("--image-dirname", type=str, default="image", help="Subdirectory name for images")
-    parser.add_argument("--label-dirname", type=str, default="seg", help="Subdirectory name for segmentation labels")
     parser.add_argument(
         "--num-classes-json",
         type=str,
@@ -173,13 +496,22 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--epochs", type=int, default=200, help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation ratio if split-yaml is not used")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device for single GPU training (e.g. cuda, cuda:0, cpu)",
+    )
+    parser.add_argument(
+    "--missing-modality-temperature",
+    type=float,
+    default=1.0,
+    help=(
+        "Loss weight for a target modality whose input modality "
+        "is missing during training. "
+        "1.0 means no extra weighting."
+    ),
     )
     args = parser.parse_args()
 
@@ -196,32 +528,42 @@ def main():
         print(f"[MultiCMR] Running in {'Distributed (DDP, World Size=' + str(world_size) + ')' if is_distributed else 'Single-GPU/CPU'} mode")
         print(f"[MultiCMR] Master rank using device: {device}")
 
-    # Case 1: Load from Split YAML
-    if args.split_yaml and os.path.exists(args.split_yaml):
-        if is_master_proc(rank):
-            print(f"[MultiCMR] Loading dataset split from YAML: {args.split_yaml}")
-        train_cases, info = load_cases_from_yaml(args.split_yaml, split="train", data_root_override=args.data_root or None)
-        val_cases, _ = load_cases_from_yaml(args.split_yaml, split="val", data_root_override=args.data_root or None)
-        source_order = args.source_order or info["source_order"]
-        num_classes_by_source = parse_num_classes(args.num_classes_json) if args.num_classes_json else info["num_classes_by_source"]
-    else:
-        # Case 2: Direct scan from data_root
-        if not args.data_root:
-            raise ValueError(f"Neither valid --split-yaml nor --data-root was provided! Missing: {args.split_yaml}")
-        source_order = args.source_order or ["2ch", "4ch", "sa"]
-        num_classes_by_source = parse_num_classes(args.num_classes_json)
-        all_cases = collect_cases(
-            data_root=args.data_root,
-            source_names=source_order,
-            image_dirname=args.image_dirname,
-            label_dirname=args.label_dirname,
+    # ============================================================
+    # Load train / val cases from Split YAML
+    # ============================================================
+
+    if not os.path.exists(args.split_yaml):
+        raise FileNotFoundError(
+            f"Split YAML not found: {args.split_yaml}"
         )
-        train_cases, val_cases = split_cases_by_source(
-            all_cases,
-            source_names=source_order,
-            val_ratio=args.val_ratio,
-            seed=args.seed,
+
+    if is_master_proc(rank):
+        print(
+            f"[MultiCMR] Loading dataset split from YAML: "
+            f"{args.split_yaml}"
         )
+
+    train_cases, info = load_cases_from_yaml(
+        args.split_yaml,
+        split="train",
+    )
+
+    val_cases, _ = load_cases_from_yaml(
+        args.split_yaml,
+        split="val",
+    )
+
+    source_order = (
+        args.source_order
+        or info["source_order"]
+    )
+
+    num_classes_by_source = (
+        parse_num_classes(args.num_classes_json)
+        if args.num_classes_json
+        else info["num_classes_by_source"]
+    )
+    
 
     if is_master_proc(rank):
         print(f"[MultiCMR] Cases: Train={len(train_cases)}, Val={len(val_cases)}")
@@ -266,7 +608,7 @@ def main():
     )
 
     model = ResUNetPP3DMultiHead(
-        in_channels=1,
+        in_channels=3,
         source_order=source_order,
         num_classes_by_source=num_classes_by_source,
     ).to(device)

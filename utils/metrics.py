@@ -4,25 +4,160 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
 
+def dice_ce_loss_per_sample(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    smooth: float = 1e-5,
+) -> torch.Tensor:
+    """
+    Calculate Dice + Cross-Entropy loss for each sample.
 
-def dice_ce_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int) -> torch.Tensor:
-    if logits.shape[2:] != target.shape[1:]:
-        logits = F.interpolate(logits, size=target.shape[1:], mode="trilinear", align_corners=False)
+    Args:
+        logits:
+            [B, C, D, H, W]
 
-    ce = F.cross_entropy(logits, target)
-    probs = F.softmax(logits, dim=1)
-    target_onehot = F.one_hot(target, num_classes=num_classes).permute(0, 4, 1, 2, 3).float()
+        target:
+            [B, D, H, W]
 
-    probs_fg = probs[:, 1:]
-    target_fg = target_onehot[:, 1:]
+        num_classes:
+            Number of segmentation classes.
 
-    dims = (0, 2, 3, 4)
-    intersection = (probs_fg * target_fg).sum(dims)
-    denominator = probs_fg.sum(dims) + target_fg.sum(dims)
-    dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
-    dice_loss = 1.0 - dice.mean()
+    Returns:
+        loss:
+            [B]
 
-    return ce + dice_loss
+    Notes:
+        The returned loss is per-sample so that the caller can
+        apply sample-specific weights, e.g. modality-missing
+        temperature weights.
+    """
+
+    if logits.ndim != 5:
+        raise ValueError(
+            f"logits must be [B,C,D,H,W], "
+            f"got {logits.shape}"
+        )
+
+    if target.ndim != 4:
+        raise ValueError(
+            f"target must be [B,D,H,W], "
+            f"got {target.shape}"
+        )
+
+    batch_size = logits.shape[0]
+
+    # ============================================================
+    # 1. Cross Entropy
+    # ============================================================
+
+    ce_loss = F.cross_entropy(
+        logits,
+        target,
+        reduction="none",
+    )
+
+    # [B,D,H,W]
+    ce_loss = ce_loss.reshape(
+        batch_size,
+        -1,
+    )
+
+    # [B]
+    ce_loss = ce_loss.mean(dim=1)
+
+    # ============================================================
+    # 2. Dice
+    # ============================================================
+
+    probs = torch.softmax(
+        logits,
+        dim=1,
+    )
+
+    target_one_hot = F.one_hot(
+        target,
+        num_classes=num_classes,
+    )
+
+    # [B,D,H,W,C]
+    target_one_hot = target_one_hot.permute(
+        0,
+        4,
+        1,
+        2,
+        3,
+    ).float()
+
+    # ------------------------------------------------------------
+    # Flatten spatial dimensions
+    # ------------------------------------------------------------
+
+    probs = probs.reshape(
+        batch_size,
+        num_classes,
+        -1,
+    )
+
+    target_one_hot = target_one_hot.reshape(
+        batch_size,
+        num_classes,
+        -1,
+    )
+
+    # ------------------------------------------------------------
+    # Per-class Dice
+    # ------------------------------------------------------------
+
+    intersection = (
+        probs * target_one_hot
+    ).sum(dim=2)
+
+    denominator = (
+        probs.sum(dim=2)
+        + target_one_hot.sum(dim=2)
+    )
+
+    dice = (
+        2.0 * intersection + smooth
+    ) / (
+        denominator + smooth
+    )
+
+    # [B]
+    dice = dice.mean(dim=1)
+
+    dice_loss = 1.0 - dice
+
+    # ============================================================
+    # 3. Dice + CE
+    # ============================================================
+
+    loss = dice_loss + ce_loss
+
+    return loss
+
+
+def dice_ce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    smooth: float = 1e-5,
+) -> torch.Tensor:
+    """
+    Standard scalar Dice + CE loss.
+
+    Kept for compatibility with other code.
+    """
+
+    loss = dice_ce_loss_per_sample(
+        logits=logits,
+        target=target,
+        num_classes=num_classes,
+        smooth=smooth,
+    )
+
+    return loss.mean()
 
 
 class DiceCELoss(nn.Module):
