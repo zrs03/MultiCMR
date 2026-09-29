@@ -257,8 +257,6 @@ def run_one_epoch(
             # ====================================================
 
             logits_dict = outputs["logits"]
-
-            graph_nodes = outputs["graph_nodes"]
             
             for src_index, src_name in enumerate(
                 source_order
@@ -506,7 +504,7 @@ def main():
     parser.add_argument(
     "--missing-modality-temperature",
     type=float,
-    default=1.0,
+    default=0.1,
     help=(
         "Loss weight for a target modality whose input modality "
         "is missing during training. "
