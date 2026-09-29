@@ -55,11 +55,11 @@ class AnatomyMaskedTransformer(nn.Module):
         序列排布: [2CH_patches (P), 4CH_patches (P), SA_patches (P), Anatomy_Tokens (5)]
         
         Anatomy 索引:
-            0: LV_myo (可见: 2CH, 4CH, SA)
-            1: LV_cav (可见: 2CH, 4CH, SA)
-            2: RV_cav (可见: 4CH, SA)
-            3: RA     (可见: 4CH)
-            4: LA     (可见: 4CH)
+            0: LV_myo
+            1: LV_cav
+            2: RV_cav
+            3: RA
+            4: LA
         """
         P = self.num_patches
         N = self.total_tokens
@@ -70,24 +70,28 @@ class AnatomyMaskedTransformer(nn.Module):
         # 1. 对角线自身可见
         mask.fill_diagonal_(0.0)
 
-        # 2. 图像 Patch 区域 (前 3*P 个 Token) 内部全互通（切面内及跨切面注意力）
-        mask[: 3 * P, : 3 * P] = 0.0
+        # 2. Patch-Patch: 只允许同视图内部互通，禁止跨切面 Patch 直接互看
+        # View 0 (2CH): 0 ~ P-1
+        # View 1 (4CH): P ~ 2P-1
+        # View 2 (SA):  2P ~ 3P-1
+        for v in range(3):
+            v_start = v * P
+            v_end = (v + 1) * P
+            mask[v_start:v_end, v_start:v_end] = 0.0
 
-        # 3. 各切面 Patch 区间切片
+        # 3. Patch-Anatomy: 保持生理连通
         view_slices = {
             "2ch": slice(0 * P, 1 * P),
             "4ch": slice(1 * P, 2 * P),
             "sa":  slice(2 * P, 3 * P),
         }
 
-        # 4. 解剖 Token 与切面 Patch 之间的双向可见性绑定
-        # (解剖索引, 可见的切面列表)
         anatomy_visibility = [
-            (0, ["2ch", "4ch", "sa"]),  # LV_myo
-            (1, ["2ch", "4ch", "sa"]),  # LV_cav
-            (2, ["4ch", "sa"]),         # RV_cav
-            (3, ["4ch"]),               # RA
-            (4, ["4ch"]),               # LA
+            (0, ["2ch", "4ch", "sa"]),  # LV_myo <-> 2CH, 4CH, SA
+            (1, ["2ch", "4ch", "sa"]),  # LV_cav <-> 2CH, 4CH, SA
+            (2, ["4ch", "sa"]),         # RV_cav <-> 4CH, SA
+            (3, ["4ch"]),               # RA     <-> 4CH
+            (4, ["4ch"]),               # LA     <-> 4CH
         ]
 
         anat_base = 3 * P
@@ -98,6 +102,29 @@ class AnatomyMaskedTransformer(nn.Module):
                 # 双向可见: View Patch <-> Anatomy Token
                 mask[v_slice, token_pos] = 0.0
                 mask[token_pos, v_slice] = 0.0
+
+        # 4. Anatomy-Anatomy: 增加生理拓扑连接
+        # 生理邻接与血流拓扑边关系:
+        # (0, 1): LV_myo <-> LV_cav (心肌包绕心室)
+        # (0, 2): LV_myo <-> RV_cav (室间隔与右室相连)
+        # (1, 2): LV_cav <-> RV_cav (左右心室通过室间隔相邻)
+        # (1, 4): LV_cav <-> LA     (二尖瓣连通)
+        # (2, 3): RV_cav <-> RA     (三尖瓣连通)
+        # (3, 4): RA     <-> LA     (房间隔相邻)
+        anatomy_topo_pairs = [
+            (0, 1),
+            (0, 2),
+            (1, 2),
+            (1, 4),
+            (2, 3),
+            (3, 4),
+        ]
+
+        for a1, a2 in anatomy_topo_pairs:
+            pos1 = anat_base + a1
+            pos2 = anat_base + a2
+            mask[pos1, pos2] = 0.0
+            mask[pos2, pos1] = 0.0
 
         return mask
 
@@ -118,6 +145,7 @@ class AnatomyMaskedTransformer(nn.Module):
             nodes,
             mask=self.attention_mask,
         )
+
 
 class SqueezeExcitation3D(nn.Module):
     def __init__(self, channels: int, reduction: int = 8) -> None:
@@ -345,7 +373,8 @@ class ResUNetPP3DMultiHead(nn.Module):
             for src in self.source_order
         })
 
-        self.gamma_patch = nn.Parameter(torch.zeros(1))
+        # 允许 Transformer 从第 0 轮介入反向传播
+        self.gamma_patch = nn.Parameter(torch.ones(1) * 0.1)
 
         self.decoders = nn.ModuleDict()
         for src in self.source_order:
@@ -363,9 +392,7 @@ class ResUNetPP3DMultiHead(nn.Module):
         s4 = self.encoder["c4"](s3)
         b = self.encoder["b"](s4)
 
-        # 将 modality embedding 共享给共享编码器的 Bottleneck 特征，赋予其切面模态感知
         if modality_emb is not None:
-            # modality_emb: [1, 1, 256] -> [B, 256, 1, 1, 1] 并相加广播
             emb_bias = modality_emb.view(-1, 256, 1, 1, 1)
             b = b + emb_bias
 
@@ -388,7 +415,6 @@ class ResUNetPP3DMultiHead(nn.Module):
             xi = x[:, i : i + 1]
             mod_emb = self.modality_embedding[src]
 
-            # 共享编码器编码时同时传入该模态专属的 modality embedding
             s1, s2, s3, b = self.encode(xi, modality_emb=mod_emb)
             skips[src] = (s1, s2, s3, b)
 
