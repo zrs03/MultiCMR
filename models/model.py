@@ -17,6 +17,7 @@ class AnatomyGraphTransformer(nn.Module):
         super().__init__()
         self.num_patches = num_patches_per_view
         self.num_anatomy = num_anatomy_nodes
+        self.heads = heads
         self.total_nodes = 3 * num_patches_per_view + num_anatomy_nodes
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -39,8 +40,9 @@ class AnatomyGraphTransformer(nn.Module):
             torch.randn(1, num_anatomy_nodes, feature_dim) * 0.02
         )
 
+        # 静态解剖先验掩码（基底拓扑）
         self.register_buffer(
-            "graph_mask",
+            "base_graph_mask",
             self.build_graph_mask(),
         )
 
@@ -89,7 +91,44 @@ class AnatomyGraphTransformer(nn.Module):
         )
         return mask
 
-    def forward(self, nodes):
+    def build_dynamic_mask(self, modality_mask: torch.Tensor) -> torch.Tensor:
+        """
+        方案一核心：动态构造单向注意力掩码
+        modality_mask: [B, 3]，1 表示存在，0 表示缺失
+        输出: [B * heads, N, N]
+        """
+        B = modality_mask.shape[0]
+        P = self.num_patches
+        N = self.total_nodes
+
+        # 复制基础解剖拓扑掩码: [B, N, N]
+        mask = self.base_graph_mask.unsqueeze(0).repeat(B, 1, 1).clone()
+
+        # 对每个缺失的视图，阻断其它节点看它的视线（作为 Key/Value 被屏蔽）
+        for v in range(3):
+            # missing_idx: 批次中缺失视图 v 的样本索引
+            missing = (modality_mask[:, v] == 0)
+            if missing.any():
+                v_start = v * P
+                v_end = (v + 1) * P
+                
+                # 关键：当视图 v 缺失时，任何其他健康节点和解剖节点，
+                # 都不能将注意力放在视图 v 上（mask[..., :, v_start:v_end] 置为 -inf）
+                mask[missing, :, v_start:v_end] = float("-inf")
+                
+                # 保留自环（防止全为 -inf 出现 NaN）
+                for p_idx in range(v_start, v_end):
+                    mask[missing, p_idx, p_idx] = 0.0
+
+        # 适配 multi-head 维度: [B * heads, N, N]
+        mask = mask.repeat_interleave(self.heads, dim=0)
+        return mask
+
+    def forward(self, nodes, modality_mask=None):
+        """
+        nodes: [B, 3 * P + 5, 256]
+        modality_mask: [B, 3]
+        """
         P = self.num_patches
         B, N, C = nodes.shape
 
@@ -102,9 +141,15 @@ class AnatomyGraphTransformer(nn.Module):
 
         nodes = torch.cat([patch_nodes, anatomy_nodes], dim=1)
 
+        # 构造动态样本掩码
+        if modality_mask is not None:
+            dyn_mask = self.build_dynamic_mask(modality_mask)
+        else:
+            dyn_mask = self.base_graph_mask
+
         return self.transformer(
             nodes,
-            mask=self.graph_mask,
+            mask=dyn_mask,
         )
 
 
@@ -250,10 +295,8 @@ class ResUNetPP3DMultiHead(nn.Module):
         self.source_order = list(source_order)
         self.num_classes_by_source = num_classes_by_source or {"2ch": 3, "4ch": 6, "sa": 4}
 
-        # Patch 3D 卷积映射配置
-        # 对应 Bottleneck 尺寸 (8, 20, 20)，经核大小与步长 (4, 10, 10) 卷积后得到 (2, 2, 2) 网格，P = 8
-        self.patch_size = (1, 1, 1)
-        self.patch_grid = (8, 20, 20)
+        self.patch_size = (2, 2, 2)
+        self.patch_grid = (4, 10, 10)
         self.num_patches = self.patch_grid[0] * self.patch_grid[1] * self.patch_grid[2]
 
         self.encoder = nn.ModuleDict({
@@ -264,7 +307,6 @@ class ResUNetPP3DMultiHead(nn.Module):
             "b": ASPP3D(128, 256),
         })
 
-        # Conv3d Patch Projection 层 (ViT 核心思想: 替代全局平均池化)
         self.patch_proj = nn.Conv3d(
             in_channels=256,
             out_channels=256,
@@ -272,11 +314,8 @@ class ResUNetPP3DMultiHead(nn.Module):
             stride=self.patch_size,
         )
 
-        self.missing_tokens = nn.ParameterDict({
-            "2ch": nn.Parameter(torch.randn(self.num_patches, 256) * 0.02),
-            "4ch": nn.Parameter(torch.randn(self.num_patches, 256) * 0.02),
-            "sa": nn.Parameter(torch.randn(self.num_patches, 256) * 0.02),
-        })
+        # 方案一：采用通用的可学习 mask token 代替每个模态独立的硬常数
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 256))
 
         self.modality_embedding = nn.ParameterDict({
             "2ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
@@ -293,7 +332,6 @@ class ResUNetPP3DMultiHead(nn.Module):
             layers=2,
         )
 
-        # 零初始化残差门控，保证训练平稳
         self.gamma = nn.Parameter(torch.zeros(1))
 
         self.decoders = nn.ModuleDict()
@@ -309,10 +347,6 @@ class ResUNetPP3DMultiHead(nn.Module):
         return s1, s2, s3, b
 
     def feature_to_token(self, b):
-        """
-        ViT Conv3d Patch Projection:
-        feature map [B, 256, D, H, W] -> Conv3d projection -> [B, 256, 2, 2, 2] -> [B, P=8, 256]
-        """
         x_proj = self.patch_proj(b)
         B, C, _, _, _ = x_proj.shape
         return x_proj.view(B, C, -1).transpose(1, 2)
@@ -330,12 +364,15 @@ class ResUNetPP3DMultiHead(nn.Module):
             s1, s2, s3, b = self.encode(xi)
             skips[src] = (s1, s2, s3, b)
 
-            token = self.feature_to_token(b)
+            token = self.feature_to_token(b)  # [B, P, 256]
             missing = (present == 0)
+
+            # 方案一：缺失位置置为纯净的统一 mask_token，不再引入模态偏差
             if missing.any():
                 token = token.clone()
-                token[missing] = self.missing_tokens[src].unsqueeze(0).expand(missing.sum(), -1, -1)
+                token[missing] = self.mask_token.expand(missing.sum(), P, -1)
 
+            # 叠加模态辨识标识
             token = token + self.modality_embedding[src]
             modality_features.append(token)
 
@@ -343,7 +380,9 @@ class ResUNetPP3DMultiHead(nn.Module):
         anatomy_nodes = self.anatomy_tokens.unsqueeze(0).expand(B, -1, -1)
 
         nodes = torch.cat([modality_nodes, anatomy_nodes], dim=1)
-        graph_out = self.graph(nodes)
+        
+        # 传入 modality_mask，图网络内部动态单向遮蔽缺失模态作为 Key 的注意力
+        graph_out = self.graph(nodes, modality_mask=modality_mask)
 
         updated_patches = graph_out[:, : 3 * P, :].view(B, 3, P, 256)
 
