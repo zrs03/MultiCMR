@@ -56,6 +56,7 @@ def parse_num_classes(config: str) -> Dict[str, int]:
         return json.loads(config)
     return {"2ch": 3, "4ch": 6, "sa": 4}
 
+
 def sample_modality_mask(
     batch_size: int,
     num_modalities: int,
@@ -63,21 +64,7 @@ def sample_modality_mask(
 ) -> torch.Tensor:
     """
     Randomly sample a non-empty multi-hot modality mask.
-
-    For 3 modalities, possible masks are:
-
-        [1,0,0]
-        [0,1,0]
-        [0,0,1]
-        [1,1,0]
-        [1,0,1]
-        [0,1,1]
-        [1,1,1]
-
-    Returns:
-        mask: [B, num_modalities], float32
     """
-
     if num_modalities != 3:
         raise ValueError(
             "Current modality-mask sampling expects exactly "
@@ -123,6 +110,7 @@ def run_one_epoch(
     num_classes_by_source: Dict[str, int],
     is_train: bool,
     missing_modality_temperature: float = 1.0,
+    token_loss_weight: float = 0.5,
     is_distributed: bool = False,
     world_size: int = 1,
 ):
@@ -151,8 +139,6 @@ def run_one_epoch(
             non_blocking=True,
         )
 
-        # [B, 3, D, H, W]
-
         if batch["masks"] is None:
             raise RuntimeError(
                 "Training/validation requires annotations, "
@@ -174,29 +160,12 @@ def run_one_epoch(
         # ========================================================
 
         if is_train:
-
-            # Random non-empty multi-hot mask
-            #
-            # [B, 3]
-            #
-            # Example:
-            #
-            # [1,0,1]
-            # [1,1,1]
-            # [0,1,0]
-
             modality_mask = sample_modality_mask(
                 batch_size=batch_size,
                 num_modalities=len(source_order),
                 device=device,
             )
-
         else:
-
-            # Validation always uses all three modalities.
-            #
-            # [B,3] = [[1,1,1], ...]
-
             modality_mask = torch.ones(
                 batch_size,
                 len(source_order),
@@ -213,17 +182,6 @@ def run_one_epoch(
             * modality_mask[:, :, None, None, None]
         )
 
-        # Shape:
-        #
-        # images:
-        #     [B,3,D,H,W]
-        #
-        # modality_mask:
-        #     [B,3]
-        #
-        # masked_images:
-        #     [B,3,D,H,W]
-
         # ========================================================
         # 4. Zero gradient
         # ========================================================
@@ -237,45 +195,29 @@ def run_one_epoch(
 
         with torch.set_grad_enabled(is_train):
 
+            # 传入完整 images 用于获取缺失模态应有的真实 Token (full_x)
             outputs = model(
                 masked_images,
                 modality_mask,
+                full_x=images if is_train else None,
             )
 
-            # outputs:
-            #
-            # {
-            #     "2ch": [B,3,D,H,W],
-            #     "4ch": [B,6,D,H,W],
-            #     "sa":  [B,4,D,H,W],
-            # }
-
-            total_loss = 0.0
+            total_seg_loss = 0.0
 
             # ====================================================
-            # 6. Calculate loss for each source
+            # 6. Calculate segmentation loss for each source
             # ====================================================
 
             logits_dict = outputs["logits"]
             
-            for src_index, src_name in enumerate(
-                source_order
-            ):
+            for src_index, src_name in enumerate(source_order):
 
                 logits = logits_dict[src_name]
-
                 target = masks[src_name]
+                num_classes = num_classes_by_source[src_name]
 
-                num_classes = (
-                    num_classes_by_source[src_name]
-                )
-
-                # ------------------------------------------------
-                # Spatial alignment
-                # ------------------------------------------------
-
+                # 空间对齐
                 if logits.shape[2:] != target.shape[1:]:
-
                     logits = F.interpolate(
                         logits,
                         size=target.shape[1:],
@@ -283,67 +225,24 @@ def run_one_epoch(
                         align_corners=False,
                     )
 
-                # ------------------------------------------------
                 # Per-sample Dice + CE
-                # ------------------------------------------------
-
-                loss_per_sample = (
-                    dice_ce_loss_per_sample(
-                        logits=logits,
-                        target=target,
-                        num_classes=num_classes,
-                    )
+                loss_per_sample = dice_ce_loss_per_sample(
+                    logits=logits,
+                    target=target,
+                    num_classes=num_classes,
                 )
 
-                # ------------------------------------------------
                 # Temperature weighting
-                # ------------------------------------------------
-                #
-                # modality_mask[:, src_index]:
-                #
-                #     1 -> modality present
-                #     0 -> modality missing
-                #
-                # Therefore:
-                #
-                #     present -> weight 1
-                #     missing -> weight T
-                #
-
-                present = modality_mask[
-                    :, src_index
-                ]
-
+                present = modality_mask[:, src_index]
                 loss_weight = (
                     present
-                    + (
-                        1.0 - present
-                    )
-                    * missing_modality_temperature
+                    + (1.0 - present) * missing_modality_temperature
                 )
 
-                # [B]
+                source_loss = (loss_per_sample * loss_weight).mean()
+                total_seg_loss = total_seg_loss + source_loss
 
-                weighted_loss = (
-                    loss_per_sample
-                    * loss_weight
-                )
-
-                # [scalar]
-
-                source_loss = (
-                    weighted_loss.mean()
-                )
-
-                total_loss = (
-                    total_loss
-                    + source_loss
-                )
-
-                # ------------------------------------------------
                 # Metrics
-                # ------------------------------------------------
-
                 dice, iou = multiclass_dice_iou(
                     logits,
                     target,
@@ -351,38 +250,45 @@ def run_one_epoch(
                 )
 
                 source_stats[src_name]["dice"].append(
-                    float(
-                        dice.detach()
-                        .cpu()
-                        .item()
-                    )
+                    float(dice.detach().cpu().item())
                 )
 
                 source_stats[src_name]["iou"].append(
-                    float(
-                        iou.detach()
-                        .cpu()
-                        .item()
-                    )
+                    float(iou.detach().cpu().item())
                 )
 
-            # ====================================================
-            # 7. Average three segmentation tasks
-            # ====================================================
+            batch_loss = total_seg_loss / len(source_order)
 
-            batch_loss = (
-                total_loss
-                / len(source_order)
-            )
+            # ====================================================
+            # 7. 计算缺失模态 Token 重建 Loss
+            # ====================================================
+            total_token_loss = torch.tensor(0.0, device=device)
+            if is_train and "gt_tokens" in outputs and outputs["gt_tokens"]:
+                pred_tokens_dict = outputs["pred_tokens"]
+                gt_tokens_dict = outputs["gt_tokens"]
+
+                missing_count = 0
+                for src_index, src_name in enumerate(source_order):
+                    missing_mask = (modality_mask[:, src_index] == 0)  # [B]
+                    if missing_mask.any():
+                        pred_t = pred_tokens_dict[src_name][missing_mask]  # [M, P, C]
+                        gt_t = gt_tokens_dict[src_name][missing_mask]      # [M, P, C]
+                        
+                        # MSE 重建损失
+                        recon_loss = F.mse_loss(pred_t, gt_t)
+                        total_token_loss = total_token_loss + recon_loss
+                        missing_count += 1
+
+                if missing_count > 0:
+                    total_token_loss = total_token_loss / missing_count
+                    batch_loss = batch_loss + token_loss_weight * total_token_loss
 
             # ====================================================
             # 8. Backward
             # ====================================================
 
             if is_train:
-
                 batch_loss.backward()
-
                 optimizer.step()
 
         # ========================================================
@@ -392,25 +298,18 @@ def run_one_epoch(
         loss_val = batch_loss.detach()
 
         if is_distributed:
-
             loss_val = reduce_tensor(
                 loss_val,
                 world_size,
             )
 
-        epoch_loss += float(
-            loss_val.cpu().item()
-        )
+        epoch_loss += float(loss_val.cpu().item())
 
     # ============================================================
     # 10. Epoch average loss
     # ============================================================
 
-    num_steps = max(
-        len(loader),
-        1,
-    )
-
+    num_steps = max(len(loader), 1)
     epoch_loss /= num_steps
 
     # ============================================================
@@ -420,56 +319,21 @@ def run_one_epoch(
     summarized = {}
 
     for src in source_order:
+        dice_values = source_stats[src]["dice"]
+        iou_values = source_stats[src]["iou"]
 
-        dice_values = (
-            source_stats[src]["dice"]
-        )
-
-        iou_values = (
-            source_stats[src]["iou"]
-        )
-
-        mean_dice = (
-            float(np.mean(dice_values))
-            if dice_values
-            else 0.0
-        )
-
-        mean_iou = (
-            float(np.mean(iou_values))
-            if iou_values
-            else 0.0
-        )
+        mean_dice = float(np.mean(dice_values)) if dice_values else 0.0
+        mean_iou = float(np.mean(iou_values)) if iou_values else 0.0
 
         if is_distributed:
+            d_tensor = torch.tensor(mean_dice, device=device)
+            i_tensor = torch.tensor(mean_iou, device=device)
 
-            d_tensor = torch.tensor(
-                mean_dice,
-                device=device,
-            )
+            d_tensor = reduce_tensor(d_tensor, world_size)
+            i_tensor = reduce_tensor(i_tensor, world_size)
 
-            i_tensor = torch.tensor(
-                mean_iou,
-                device=device,
-            )
-
-            d_tensor = reduce_tensor(
-                d_tensor,
-                world_size,
-            )
-
-            i_tensor = reduce_tensor(
-                i_tensor,
-                world_size,
-            )
-
-            mean_dice = float(
-                d_tensor.cpu().item()
-            )
-
-            mean_iou = float(
-                i_tensor.cpu().item()
-            )
+            mean_dice = float(d_tensor.cpu().item())
+            mean_iou = float(i_tensor.cpu().item())
 
         summarized[src] = {
             "dice": mean_dice,
@@ -477,6 +341,7 @@ def run_one_epoch(
         }
 
     return epoch_loss, summarized
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train 3D ResUNet++ multi-head on multi-sequence CMR NIfTI")
@@ -502,14 +367,20 @@ def main():
         help="Device for single GPU training (e.g. cuda, cuda:0, cpu)",
     )
     parser.add_argument(
-    "--missing-modality-temperature",
-    type=float,
-    default=0.1,
-    help=(
-        "Loss weight for a target modality whose input modality "
-        "is missing during training. "
-        "1.0 means no extra weighting."
-    ),
+        "--missing-modality-temperature",
+        type=float,
+        default=0.1,
+        help=(
+            "Loss weight for a target modality whose input modality "
+            "is missing during training. "
+            "1.0 means no extra weighting."
+        ),
+    )
+    parser.add_argument(
+        "--token-loss-weight",
+        type=float,
+        default=0.5,
+        help="Loss weight for reconstructing tokens of missing modalities from present modalities/anatomy.",
     )
     args = parser.parse_args()
 
@@ -561,7 +432,6 @@ def main():
         if args.num_classes_json
         else info["num_classes_by_source"]
     )
-    
 
     if is_master_proc(rank):
         print(f"[MultiCMR] Cases: Train={len(train_cases)}, Val={len(val_cases)}")
@@ -644,6 +514,8 @@ def main():
             source_order=source_order,
             num_classes_by_source=num_classes_by_source,
             is_train=True,
+            missing_modality_temperature=args.missing_modality_temperature,
+            token_loss_weight=args.token_loss_weight,
             is_distributed=is_distributed,
             world_size=world_size,
         )
