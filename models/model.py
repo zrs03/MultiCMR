@@ -241,39 +241,33 @@ class DecoderBlock3D(nn.Module):
 
 class Encoder3D(nn.Module):
     """
-    单视图 3D 编码器。每个视图各持有一份实例，
-    低层特征与 BN 统计量完全按本视图分布学习。
+    单视图 3D 编码器。
+    每个视图各持有一份实例，低层特征与 BN 统计量完全按本视图分布学习。
     """
     def __init__(self, in_channels: int = 1) -> None:
         super().__init__()
-        self.c1 = StemBlock3D(in_channels, 32, 1)
+        self.c1 = StemBlock3D(in_channels, 32, stride=2)
         self.c2 = ResBlock3D(32, 32, 2)
         self.c3 = ResBlock3D(32, 64, 2)
-        self.c4 = ResBlock3D(64, 128, 2)
-        self.b = ASPP3D(128, 256)
+        self.b = ASPP3D(64, 256)
 
     def forward(self, x: torch.Tensor):
         s1 = self.c1(x)
         s2 = self.c2(s1)
         s3 = self.c3(s2)
-        s4 = self.c4(s3)
-        b = self.b(s4)
+        b = self.b(s3)
         return s1, s2, s3, b
 
 
 # ----------------------------------------------------------------------
-# 共享 Decoder 主干（类别相关的 head 移到主模型中按视图分开）
+# 共享 Decoder 主干
 # ----------------------------------------------------------------------
 
 class SharedDecoderTrunk3D(nn.Module):
     """
     三视图共享的解码主干：d1~d3 + ASPP，输出 16 通道特征图。
-
-    共享的依据：不同视图的分割解码规则高度共通（心肌是闭合环、
-    腔室被心肌包绕、边界平滑等），共享主干等价于跨视图正则化。
-    FiLM 层同样共享——cond 都是 256 维解剖条件向量，
-    差异已由 cond 本身的内容表达。
-
+    分割解码规则跨视图共通，共享主干等价于跨视图正则化。
+    FiLM 层共享，视图差异由 256 维解剖条件向量 cond 的内容表达。
     类别数不同（2ch:3 / 4ch:6 / sa:4），分割 head 不共享，
     见 ResUNetPP3DMultiHead.heads。
     """
@@ -322,7 +316,7 @@ class SharedDecoderTrunk3D(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# MAE 式缺失视图重建器（与 v2 相同）
+# MAE 式缺失视图重建器
 # ----------------------------------------------------------------------
 
 class MissingViewReconstructor(nn.Module):
@@ -338,7 +332,7 @@ class MissingViewReconstructor(nn.Module):
         num_patches: int,
         feature_dim: int = 256,
         heads: int = 8,
-        layers: int = 1,
+        layers: int = 2,
     ) -> None:
         super().__init__()
         self.num_patches = num_patches
@@ -386,26 +380,23 @@ class ResUNetPP3DMultiHead(nn.Module):
         self.patch_grid = (4, 10, 10)
         self.num_patches = self.patch_grid[0] * self.patch_grid[1] * self.patch_grid[2]
 
-        # ==================================================================
-        # v3 修改点 1：每视图独立 Encoder。
-        # 彻底解决共享 BN 统计量混合三种视图分布的问题。
-        # ==================================================================
         self.encoders = nn.ModuleDict({
             src: Encoder3D(in_channels) for src in self.source_order
         })
 
-        # patch 投影保持共享：把三个独立 encoder 的 bottleneck 特征
-        # 映射到同一 token 空间，便于颈部 Transformer 融合。
-        self.patch_proj = nn.Conv3d(
-            in_channels=256,
-            out_channels=256,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-        )
+        # 每视图独立的 patch 投影：把本视图 encoder 的 bottleneck 特征
+        # 映射到 token 空间，投影分布按本视图学习。
+        self.patch_projs = nn.ModuleDict({
+            src: nn.Conv3d(
+                in_channels=256,
+                out_channels=256,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+            )
+            for src in self.source_order
+        })
 
-        # token 层 modality embedding（保留）：
-        # 颈部融合序列需要区分 patch 来自哪个视图。
-        # v2 中特征层的 emb_bias 已删除（encoder 按视图分开后冗余）。
+        # token 层 modality embedding：颈部融合序列需要区分 patch 来自哪个视图。
         self.modality_embedding = nn.ParameterDict({
             "2ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
             "4ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
@@ -421,7 +412,7 @@ class ResUNetPP3DMultiHead(nn.Module):
             num_patches_per_view=self.num_patches,
             num_anatomy_nodes=5,
             heads=8,
-            layers=1,
+            layers=2,
         )
 
         # 第二阶段：更新后的 anatomy tokens + 重建后的 patch tokens 做最终跨模态融合。
@@ -430,7 +421,7 @@ class ResUNetPP3DMultiHead(nn.Module):
             num_patches_per_view=self.num_patches,
             num_anatomy_nodes=5,
             heads=8,
-            layers=1,
+            layers=2,
         )
 
         self.anatomy_indices_by_view = {
@@ -439,13 +430,12 @@ class ResUNetPP3DMultiHead(nn.Module):
             "sa": [0, 1, 2],             # LV_myo, LV_cav, RV_cav
         }
 
-        # MAE 式缺失视图重建器（v2 引入，保留）
         self.reconstructors = nn.ModuleDict({
             src: MissingViewReconstructor(
                 num_patches=self.num_patches,
                 feature_dim=256,
                 heads=8,
-                layers=1,
+                layers=2,
             )
             for src in self.source_order
         })
@@ -464,9 +454,6 @@ class ResUNetPP3DMultiHead(nn.Module):
         self.gamma_patch = nn.Parameter(torch.ones(1) * 0.1)
         self.gamma_recon = nn.Parameter(torch.ones(1))
 
-        # ==================================================================
-        # v3 修改点 2：共享 Decoder 主干 + 每视图独立分割 head。
-        # ==================================================================
         self.decoder_trunk = SharedDecoderTrunk3D()
         self.heads = nn.ModuleDict({
             src: nn.Conv3d(16, self.num_classes_by_source[src], kernel_size=1)
@@ -474,11 +461,11 @@ class ResUNetPP3DMultiHead(nn.Module):
         })
 
     def encode(self, src: str, x: torch.Tensor):
-        """用视图 src 自己的 encoder 编码。不再加特征层 modality 偏置。"""
+        """用视图 src 自己的 encoder 编码。"""
         return self.encoders[src](x)
 
-    def feature_to_token(self, b):
-        x_proj = self.patch_proj(b)
+    def feature_to_token(self, src: str, b):
+        x_proj = self.patch_projs[src](b)
         B, C, _, _, _ = x_proj.shape
         return x_proj.view(B, C, -1).transpose(1, 2)
 
@@ -501,7 +488,7 @@ class ResUNetPP3DMultiHead(nn.Module):
                 for i, src in enumerate(self.source_order):
                     xi_full = full_x[:, i : i + 1]
                     _, _, _, b_full = self.encode(src, xi_full)
-                    gt_token = self.feature_to_token(b_full) + self.modality_embedding[src]
+                    gt_token = self.feature_to_token(src, b_full) + self.modality_embedding[src]
                     gt_tokens[src] = gt_token
 
         anatomy_nodes_init = self.anatomy_tokens.unsqueeze(0).expand(B, -1, -1)
@@ -513,11 +500,10 @@ class ResUNetPP3DMultiHead(nn.Module):
             present = modality_mask[:, i].bool()
             xi = x[:, i : i + 1]
 
-            # v3：每个视图走自己的 encoder
             s1, s2, s3, b = self.encode(src, xi)
             skips[src] = (s1, s2, s3, b)
 
-            token = self.feature_to_token(b) + self.modality_embedding[src]
+            token = self.feature_to_token(src, b) + self.modality_embedding[src]
             raw_modality_tokens.append(token)
             modality_present.append(present)
 
@@ -598,7 +584,6 @@ class ResUNetPP3DMultiHead(nn.Module):
             sel_tokens = updated_anatomy[:, sel_indices, :]
             cond = self.anatomy_cond_proj[src](sel_tokens.reshape(B, -1))
 
-            # v3：共享主干解码 + 本视图独立 head
             feat = self.decoder_trunk(s1, s2, s3, b, cond=cond)
             outputs[src] = self.heads[src](feat)
 

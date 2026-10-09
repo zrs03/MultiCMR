@@ -379,7 +379,7 @@ def main():
     parser.add_argument(
         "--token-loss-weight",
         type=float,
-        default=0.5,
+        default=0.01,
         help="Loss weight for reconstructing tokens of missing modalities from present modalities/anatomy.",
     )
     args = parser.parse_args()
