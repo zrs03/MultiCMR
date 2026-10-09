@@ -95,7 +95,7 @@ def sample_modality_mask(
     return candidates[indices]
 
 
-def get_model_core(model: torch.nn.Module) -> ResUNetPP3DMultiHead:
+def get_model_core(model: torch.nn.Module):
     if isinstance(model, DDP):
         return model.module
     return model
@@ -203,6 +203,7 @@ def run_one_epoch(
             )
 
             total_seg_loss = 0.0
+            total_loss_weight = 0.0  # 用于有效权重归一化
 
             # ====================================================
             # 6. Calculate segmentation loss for each source
@@ -241,6 +242,9 @@ def run_one_epoch(
 
                 source_loss = (loss_per_sample * loss_weight).mean()
                 total_seg_loss = total_seg_loss + source_loss
+                
+                # 累加有效权重
+                total_loss_weight = total_loss_weight + loss_weight.mean()
 
                 # Metrics
                 dice, iou = multiclass_dice_iou(
@@ -257,7 +261,8 @@ def run_one_epoch(
                     float(iou.detach().cpu().item())
                 )
 
-            batch_loss = total_seg_loss / len(source_order)
+            # 采用有效权重归一化，替代原来的 / len(source_order)
+            batch_loss = total_seg_loss / (total_loss_weight + 1e-8)
 
             # ====================================================
             # 7. 计算缺失模态 Token 重建 Loss
@@ -369,7 +374,7 @@ def main():
     parser.add_argument(
         "--missing-modality-temperature",
         type=float,
-        default=0.1,
+        default=0.0,
         help=(
             "Loss weight for a target modality whose input modality "
             "is missing during training. "
@@ -379,7 +384,7 @@ def main():
     parser.add_argument(
         "--token-loss-weight",
         type=float,
-        default=0.01,
+        default=0.0,
         help="Loss weight for reconstructing tokens of missing modalities from present modalities/anatomy.",
     )
     args = parser.parse_args()
@@ -475,7 +480,7 @@ def main():
         pin_memory=torch.cuda.is_available(),
     )
 
-    model = ResUNetPP3DMultiHead(
+    model = MMFormerAnatomy(
         in_channels=1,
         source_order=source_order,
         num_classes_by_source=num_classes_by_source,

@@ -1,594 +1,370 @@
-from typing import Dict, Sequence
+"""mmFormer-inspired multi-view cardiac MRI segmenter with convolutional 2x2x2 patch embedding.
 
+Architecture adapted from Zhang et al., MICCAI 2022 (mmFormer):
+  modality-specific CNN + intra-modal Transformer encoders;
+  missing-modality-aware inter-modal Transformer;
+  progressive CNN decoder, shared auxiliary encoder decoder and deep supervision.
+Extensions: five anatomy tokens, anatomical visibility mask, anatomy-to-patch
+fusion and view-specific segmentation heads (2CH/4CH/SA).
+
+This is an independent, runnable adaptation, NOT an exact copy of the official
+mmFormer repository. See https://github.com/YaoZhang93/mmFormer.
+
+Input: x [B, 3, D, H, W], modality_mask [B, 3] (1 = available).
+Output dict: logits: {view: [B, num_classes, D, H, W]},
+             aux_logits, deep_logits, anatomy_tokens, pred_tokens, valid_views.
+Only available views should contribute to segmentation loss.
+Tokenization: view-specific Conv3d(kernel_size=2, stride=2) on the CNN bottleneck, followed by flatten.
+Odd bottleneck dimensions are padded on the right to ensure all voxels contribute.
+`token_grid` is a positional-embedding reference grid, not the token count.
+"""
+from __future__ import annotations
+from typing import Dict, Optional, Sequence, Tuple
 import torch
-import torch.nn as nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 
+VIEWS = ("2ch", "4ch", "sa")
+ANATOMY = ("LV_myo", "LV_cav", "RV_cav", "RA", "LA")
+VISIBILITY = ((1,1,1),(1,1,1),(0,1,1),(0,1,0),(0,1,0))
 
-# ----------------------------------------------------------------------
-# 基础模块
-# ----------------------------------------------------------------------
 
-class AnatomyMaskedTransformer(nn.Module):
-    """
-    基于解剖可见性掩码（Visibility Attention Mask）的多切面 Vision Transformer。
-    纯序列注意力机制：控制各切面 Patch 与不同解剖 Token 之间的可见性。
-    """
-    def __init__(
-        self,
-        feature_dim: int = 256,
-        num_patches_per_view: int = 8,
-        num_anatomy_nodes: int = 5,
-        heads: int = 8,
-        layers: int = 2,
-    ):
+def norm(c: int) -> nn.Module:
+    for g in (8, 4, 2, 1):
+        if c % g == 0:
+            return nn.GroupNorm(g, c)
+    return nn.GroupNorm(1, c)
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, cin: int, cout: int, stride: int = 1):
         super().__init__()
-        self.num_patches = num_patches_per_view
-        self.num_anatomy = num_anatomy_nodes
-        self.total_tokens = 3 * num_patches_per_view + num_anatomy_nodes
+        self.conv = nn.Sequential(nn.Conv3d(cin, cout, 3, stride, 1, bias=False),
+                                  norm(cout), nn.ReLU(inplace=True),
+                                  nn.Conv3d(cout, cout, 3, 1, 1, bias=False), norm(cout))
+        self.skip = nn.Identity() if cin == cout and stride == 1 else nn.Conv3d(cin, cout, 1, stride)
+        self.relu = nn.ReLU(inplace=True)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=feature_dim,
-            nhead=heads,
-            dim_feedforward=feature_dim * 4,
-            batch_first=True,
-            norm_first=True,
-            dropout=0.1,
-        )
-
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=layers,
-        )
-
-        self.patch_pos_embedding = nn.Parameter(
-            torch.randn(1, 1, num_patches_per_view, feature_dim) * 0.02
-        )
-        self.anatomy_pos_embedding = nn.Parameter(
-            torch.randn(1, num_anatomy_nodes, feature_dim) * 0.02
-        )
-
-        self.register_buffer(
-            "attention_mask",
-            self.build_anatomy_attention_mask(),
-        )
-
-    def build_anatomy_attention_mask(self):
-        P = self.num_patches
-        N = self.total_tokens
-
-        mask = torch.full((N, N), float("-inf"))
-        mask.fill_diagonal_(0.0)
-        mask[: 3 * P, : 3 * P] = 0.0
-
-        view_slices = {
-            "2ch": slice(0 * P, 1 * P),
-            "4ch": slice(1 * P, 2 * P),
-            "sa":  slice(2 * P, 3 * P),
-        }
-
-        anatomy_visibility = [
-            (0, ["2ch", "4ch", "sa"]),  # LV_myo
-            (1, ["2ch", "4ch", "sa"]),  # LV_cav
-            (2, ["4ch", "sa"]),         # RV_cav
-            (3, ["4ch"]),               # RA
-            (4, ["4ch"]),               # LA
-        ]
-
-        anat_base = 3 * P
-        for anat_idx, visible_views in anatomy_visibility:
-            token_pos = anat_base + anat_idx
-            for view in visible_views:
-                v_slice = view_slices[view]
-                mask[v_slice, token_pos] = 0.0
-                mask[token_pos, v_slice] = 0.0
-
-        return mask
-
-    def forward(self, nodes, key_padding_mask=None):
-        P = self.num_patches
-        B, N, C = nodes.shape
-
-        if key_padding_mask is not None:
-            if key_padding_mask.shape != (B, N):
-                raise ValueError(
-                    f"key_padding_mask shape must be {(B, N)}, "
-                    f"but got {tuple(key_padding_mask.shape)}"
-                )
-            key_padding_mask = key_padding_mask.to(
-                device=nodes.device,
-                dtype=torch.bool,
-            )
-
-        patch_nodes = nodes[:, : 3 * P, :].view(B, 3, P, C)
-        patch_nodes = patch_nodes + self.patch_pos_embedding
-        patch_nodes = patch_nodes.view(B, 3 * P, C)
-
-        anatomy_nodes = nodes[:, 3 * P :, :]
-        anatomy_nodes = anatomy_nodes + self.anatomy_pos_embedding
-
-        nodes = torch.cat([patch_nodes, anatomy_nodes], dim=1)
-
-        return self.transformer(
-            nodes,
-            mask=self.attention_mask.to(device=nodes.device),
-            src_key_padding_mask=key_padding_mask,
-        )
+    def forward(self, x: Tensor) -> Tensor:
+        return self.relu(self.conv(x) + self.skip(x))
 
 
-class SqueezeExcitation3D(nn.Module):
-    def __init__(self, channels: int, reduction: int = 8) -> None:
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, dropout: float = 0.1):
         super().__init__()
-        hidden = max(channels // reduction, 1)
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.fc1 = nn.Linear(channels, hidden, bias=False)
-        self.fc2 = nn.Linear(hidden, channels, bias=False)
+        self.n1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.n2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4*dim), nn.GELU(),
+                                 nn.Dropout(dropout), nn.Linear(4*dim, dim), nn.Dropout(dropout))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, channels, _, _, _ = x.shape
-        pooled = self.pool(x).view(batch_size, channels)
-        weights = torch.relu(self.fc1(pooled))
-        weights = torch.sigmoid(self.fc2(weights)).view(batch_size, channels, 1, 1, 1)
-        return x * weights
+    def forward(self, x: Tensor, attn_mask: Optional[Tensor] = None,
+                key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        y = self.n1(x)
+        z, _ = self.attn(y, y, y, attn_mask=attn_mask,
+                         key_padding_mask=key_padding_mask, need_weights=False)
+        x = x + z
+        return x + self.mlp(self.n2(x))
 
 
-class StemBlock3D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, stride: int) -> None:
+class HybridViewEncoder(nn.Module):
+    """Independent CNN and intra-modal self-attention per view."""
+    def __init__(self, in_channels: int, base: int, dim: int,
+                 token_grid: Tuple[int,int,int], intra_layers: int, heads: int):
         super().__init__()
-        self.conv_path = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-        )
-        self.skip_path = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride),
-            nn.BatchNorm3d(out_channels),
-        )
-        self.se = SqueezeExcitation3D(out_channels)
+        self.c1 = ConvBlock(in_channels, base)
+        self.c2 = ConvBlock(base, base*2, 2)
+        self.c3 = ConvBlock(base*2, base*4, 2)
+        self.c4 = ConvBlock(base*4, dim, 2)
+        self.patch_embed = nn.Conv3d(dim, dim, kernel_size=2, stride=2)
+        self.position_grid = tuple(token_grid)
+        self.token_pos = nn.Parameter(torch.randn(1, dim, *token_grid) * .02)
+        self.intra = nn.ModuleList([TransformerBlock(dim, heads) for _ in range(intra_layers)])
+        self.token_norm = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.se(self.conv_path(x) + self.skip_path(x))
-
-
-class ResBlock3D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, stride: int) -> None:
-        super().__init__()
-        self.conv_path = nn.Sequential(
-            nn.BatchNorm3d(in_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-        )
-        self.skip_path = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride),
-            nn.BatchNorm3d(out_channels),
-        )
-        self.se = SqueezeExcitation3D(out_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.se(self.conv_path(x) + self.skip_path(x))
-
-
-class ASPP3D(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, rates: Sequence[int] = (1, 2, 4, 6)) -> None:
-        super().__init__()
-        self.branches = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=rate, dilation=rate),
-                nn.BatchNorm3d(out_channels),
-                nn.ReLU(inplace=True),
-            )
-            for rate in rates
-        ])
-        self.proj = nn.Conv3d(out_channels, out_channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        fused = None
-        for branch in self.branches:
-            out = branch(x)
-            fused = out if fused is None else fused + out
-        return self.proj(fused)
-
-
-class AttentionGate3D(nn.Module):
-    def __init__(self, gate_channels: int, skip_channels: int) -> None:
-        super().__init__()
-        self.g_proj = nn.Sequential(
-            nn.BatchNorm3d(gate_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(gate_channels, skip_channels, kernel_size=3, padding=1),
-            nn.MaxPool3d(kernel_size=2, stride=2),
-        )
-        self.x_proj = nn.Sequential(
-            nn.BatchNorm3d(skip_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(skip_channels, skip_channels, kernel_size=3, padding=1),
-        )
-        self.out_conv = nn.Sequential(
-            nn.BatchNorm3d(skip_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(skip_channels, skip_channels, kernel_size=3, padding=1),
-        )
-
-    def forward(self, gate: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        gated = self.g_proj(gate)
-        skip_proj = self.x_proj(skip)
-        if gated.shape[2:] != skip_proj.shape[2:]:
-            gated = F.interpolate(gated, size=skip_proj.shape[2:], mode="trilinear", align_corners=False)
-        out = self.out_conv(gated + skip_proj)
-        return out * skip
-
-
-class DecoderBlock3D(nn.Module):
-    def __init__(self, gate_channels: int, skip_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.attn = AttentionGate3D(gate_channels, skip_channels)
-        self.res = ResBlock3D(gate_channels + skip_channels, out_channels, stride=1)
-
-    def forward(self, gate: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        attn_skip = self.attn(gate, skip)
-        gate_up = F.interpolate(gate, size=attn_skip.shape[2:], mode="trilinear", align_corners=False)
-        out = torch.cat([attn_skip, gate_up], dim=1)
-        return self.res(out)
-
-
-# ----------------------------------------------------------------------
-# 独立的单视图 Encoder
-# ----------------------------------------------------------------------
-
-class Encoder3D(nn.Module):
-    """
-    单视图 3D 编码器。
-    每个视图各持有一份实例，低层特征与 BN 统计量完全按本视图分布学习。
-    """
-    def __init__(self, in_channels: int = 1) -> None:
-        super().__init__()
-        self.c1 = StemBlock3D(in_channels, 32, stride=2)
-        self.c2 = ResBlock3D(32, 32, 2)
-        self.c3 = ResBlock3D(32, 64, 2)
-        self.b = ASPP3D(64, 256)
-
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: Tensor):
         s1 = self.c1(x)
         s2 = self.c2(s1)
         s3 = self.c3(s2)
-        b = self.b(s3)
-        return s1, s2, s3, b
+        b = self.c4(s3)
+        # Convolutional patch embedding, 2x2x2 bottleneck voxels per token.
+        # Right padding avoids dropping last voxels if spatial dimensions are odd.
+        pad_d, pad_h, pad_w = (n % 2 for n in b.shape[2:])
+        patch_map = self.patch_embed(F.pad(b, (0, pad_w, 0, pad_h, 0, pad_d)))
+        spatial_shape = patch_map.shape[2:]
+        position = F.interpolate(
+            self.token_pos, size=spatial_shape, mode="trilinear", align_corners=False
+        ).flatten(2).transpose(1, 2)
+        tokens = patch_map.flatten(2).transpose(1, 2) + position
+        for blk in self.intra:
+            tokens = blk(tokens)
+        tokens = self.token_norm(tokens)
+        return (s1, s2, s3, b), tokens
 
 
-# ----------------------------------------------------------------------
-# 共享 Decoder 主干
-# ----------------------------------------------------------------------
+class AnatomyInterModalTransformer(nn.Module):
+    """mmFormer-style inter-modal attention augmented with anatomy visibility.
 
-class SharedDecoderTrunk3D(nn.Module):
+    Patch<->patch is permitted, anatomy<->patch only for visible views;
+    anatomy<->anatomy is permitted. Missing views are masked as keys/values.
+    Missing patch queries are zeroed after fusion.
     """
-    三视图共享的解码主干：d1~d3 + ASPP，输出 16 通道特征图。
-    分割解码规则跨视图共通，共享主干等价于跨视图正则化。
-    FiLM 层共享，视图差异由 256 维解剖条件向量 cond 的内容表达。
-    类别数不同（2ch:3 / 4ch:6 / sa:4），分割 head 不共享，
-    见 ResUNetPP3DMultiHead.heads。
-    """
-    def __init__(self) -> None:
+    def __init__(self, dim: int, heads: int, layers: int,
+                 dropout: float = .1):
         super().__init__()
-        self.d1 = DecoderBlock3D(gate_channels=256, skip_channels=64, out_channels=128)
-        self.d2 = DecoderBlock3D(gate_channels=128, skip_channels=32, out_channels=64)
-        self.d3 = DecoderBlock3D(gate_channels=64, skip_channels=32, out_channels=32)
-        self.aspp = ASPP3D(32, 16)
+        self.register_buffer("visibility", torch.tensor(VISIBILITY, dtype=torch.bool))
+        self.layers = nn.ModuleList([TransformerBlock(dim, heads, dropout) for _ in range(layers)])
+        self.end_norm = nn.LayerNorm(dim)
+        self.num_heads = heads
 
-        self.film_d1 = nn.Linear(256, 128 * 2)
-        self.film_d2 = nn.Linear(256, 64 * 2)
-        self.film_d3 = nn.Linear(256, 32 * 2)
+    def _make_mask(self, p: int, device: torch.device) -> Tensor:
+        n = 3*p+5
+        mask = torch.ones(n, n, dtype=torch.bool, device=device)
+        mask[:3*p, :3*p] = False
+        mask[3*p:, 3*p:] = False
+        for a in range(5):
+            for v in range(3):
+                if VISIBILITY[a][v]:
+                    mask[3*p+a, v*p:(v+1)*p] = False
+                    mask[v*p:(v+1)*p, 3*p+a] = False
+        return mask
 
-        nn.init.zeros_(self.film_d1.weight)
-        nn.init.zeros_(self.film_d1.bias)
-        nn.init.zeros_(self.film_d2.weight)
-        nn.init.zeros_(self.film_d2.bias)
-        nn.init.zeros_(self.film_d3.weight)
-        nn.init.zeros_(self.film_d3.bias)
-
-    def apply_film(self, x: torch.Tensor, film_layer: nn.Module, cond: torch.Tensor) -> torch.Tensor:
-        gamma_beta = film_layer(cond)
-        gamma, beta = torch.chunk(gamma_beta, chunks=2, dim=1)
-        gamma = gamma[:, :, None, None, None]
-        beta = beta[:, :, None, None, None]
-        return x * (1.0 + gamma) + beta
-
-    def forward(self, skip1, skip2, skip3, bottleneck, cond=None):
-        """
-        return: [B, 16, D, H, W] 共享解码特征，交由各视图独立 head 分类。
-        """
-        x = self.d1(bottleneck, skip3)
-        if cond is not None:
-            x = self.apply_film(x, self.film_d1, cond)
-
-        x = self.d2(x, skip2)
-        if cond is not None:
-            x = self.apply_film(x, self.film_d2, cond)
-
-        x = self.d3(x, skip1)
-        if cond is not None:
-            x = self.apply_film(x, self.film_d3, cond)
-
-        return self.aspp(x)
+    def forward(self, tokens: Tensor, anatomy: Tensor, present: Tensor):
+        b, v, p, dim = tokens.shape
+        assert v == 3
+        # For an anatomy query with zero visible modalities, allow its self-key.
+        # For any missing patches, other tokens cannot read them.
+        pad = torch.cat(((~present.bool()).repeat_interleave(p, dim=1),
+                         torch.zeros(b, 5, dtype=torch.bool, device=tokens.device)), dim=1)
+        seq = torch.cat((tokens.reshape(b, 3*p, dim), anatomy), dim=1)
+        structure_mask = self._make_mask(p, tokens.device)
+        for layer in self.layers:
+            seq = layer(seq, attn_mask=structure_mask, key_padding_mask=pad)
+        seq = self.end_norm(seq)
+        patch = seq[:, :3*p].reshape(b, 3, p, dim)
+        patch = patch * present[:, :, None, None].to(patch.dtype)
+        return patch, seq[:, 3*p:]
 
 
-# ----------------------------------------------------------------------
-# MAE 式缺失视图重建器
-# ----------------------------------------------------------------------
-
-class MissingViewReconstructor(nn.Module):
-    """
-    MAE 风格的缺失视图 patch 重建。
-
-    P 个可学习 query（mask token + 位置嵌入）通过 cross-attention
-    从 memory（存在视图的 patch tokens + sample-adaptive anatomy tokens）
-    中逐 patch 取信息。重建结果随样本变化，参数量与 P 无关。
-    """
-    def __init__(
-        self,
-        num_patches: int,
-        feature_dim: int = 256,
-        heads: int = 8,
-        layers: int = 2,
-    ) -> None:
+class UpFuse(nn.Module):
+    def __init__(self, cin: int, cskip: int, cout: int):
         super().__init__()
-        self.num_patches = num_patches
+        self.fuse = ConvBlock(cin+cskip, cout)
 
-        self.mask_token = nn.Parameter(torch.randn(1, 1, feature_dim) * 0.02)
-        self.query_pos = nn.Parameter(torch.randn(1, num_patches, feature_dim) * 0.02)
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=feature_dim,
-            nhead=heads,
-            dim_feedforward=feature_dim * 4,
-            batch_first=True,
-            norm_first=True,
-            dropout=0.1,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=layers)
-        self.out_norm = nn.LayerNorm(feature_dim)
-
-    def forward(
-        self,
-        memory: torch.Tensor,
-        memory_key_padding_mask: torch.Tensor = None,
-    ) -> torch.Tensor:
-        B = memory.shape[0]
-        queries = (self.mask_token + self.query_pos).expand(B, -1, -1)
-        out = self.decoder(
-            queries,
-            memory,
-            memory_key_padding_mask=memory_key_padding_mask,
-        )
-        return self.out_norm(out)
+    def forward(self, x: Tensor, skip: Tensor):
+        x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
+        return self.fuse(torch.cat((x, skip), 1))
 
 
-# ----------------------------------------------------------------------
-# 主模型：三 Encoder + 共享 Decoder
-# ----------------------------------------------------------------------
-
-class ResUNetPP3DMultiHead(nn.Module):
-    def __init__(self, in_channels=1, source_order=("2ch", "4ch", "sa"), num_classes_by_source=None):
+class ProgressiveDecoder(nn.Module):
+    """Shared progressive upsampling decoder with anatomy FiLM conditioning."""
+    # 增加 film_hidden_dim 参数，通常可设为与 dim 相同或更大的值
+    def __init__(self, base: int, dim: int, film_hidden_dim: int = 128):
         super().__init__()
+        self.d3 = UpFuse(dim, base*4, base*4)
+        self.d2 = UpFuse(base*4, base*2, base*2)
+        self.d1 = UpFuse(base*2, base, base)
+        
+        # 1. 使用 MLP (Linear -> GELU -> Linear) 替代单一 nn.Linear
+        self.films = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, film_hidden_dim),
+                nn.GELU(),
+                nn.Linear(film_hidden_dim, 2 * c)
+            ) for c in (base*4, base*2, base)
+        ])
+        
+        # 2. 初始化策略调整：仅将最后一层初始化为全零
+        for film in self.films:
+            # 保持前置隐层的默认非零初始化，确保梯度能穿透网络回传给解剖条件特征
+            # 仅将输出层的权重和偏置设为 0，使初始状态下 gamma=0, beta=0
+            nn.init.zeros_(film[-1].weight)
+            nn.init.zeros_(film[-1].bias)
+
+    @staticmethod
+    def modulate(x: Tensor, film: nn.Module, cond: Tensor):
+        gamma, beta = film(cond).chunk(2, dim=-1)
+        return x * (1 + gamma[..., None, None, None]) + beta[..., None, None, None]
+
+    def forward(self, skips: Sequence[Tensor], cond: Optional[Tensor] = None):
+        s1, s2, s3, bottleneck = skips
+        d3 = self.d3(bottleneck, s3)
+        if cond is not None: d3 = self.modulate(d3, self.films[0], cond)
+        d2 = self.d2(d3, s2)
+        if cond is not None: d2 = self.modulate(d2, self.films[1], cond)
+        d1 = self.d1(d2, s1)
+        if cond is not None: d1 = self.modulate(d1, self.films[2], cond)
+        return d1, d2, d3
+
+class MMFormerAnatomy(nn.Module):
+    """Three-view, anatomy-aware mmFormer adaptation.
+
+    Args:
+        token_grid: reference grid for positional embeddings ONLY;
+          token count is determined by the stride-2 patch convolution output.
+        dim: Transformer / bottleneck dimension (divisible by heads).
+        base: CNN width. 16/64 are lightweight development defaults.
+        predict_missing: unavailable views are zeroed in returned logits;
+          model is designed to segment only observed views.
+    """
+    def __init__(self, in_channels: int = 1,
+                 num_classes_by_source: Optional[Dict[str,int]] = None,
+                 source_order: Sequence[str] = VIEWS,
+                 base: int = 32, dim: int = 64, heads: int = 4,
+                 token_grid: Tuple[int,int,int] = (2,4,4),
+                 intra_layers: int = 1, inter_layers: int = 2,
+                 predict_missing: bool = False):
+        super().__init__()
+        if tuple(source_order) != VIEWS:
+            raise ValueError("source_order must be ('2ch','4ch','sa') for fixed anatomy visibility")
+        if dim % heads:
+            raise ValueError("dim must be divisible by heads")
         self.source_order = list(source_order)
-        self.num_classes_by_source = num_classes_by_source or {"2ch": 3, "4ch": 6, "sa": 4}
+        self.num_classes_by_source = num_classes_by_source or {"2ch":3, "4ch":6, "sa":4}
+        self.token_grid = token_grid
+        self.p = None  # Dynamic: product of patch-convolution output dimensions
+        self.base = base
+        self.dim = dim
+        self.predict_missing = predict_missing
+        self.encoders = nn.ModuleDict({v: HybridViewEncoder(in_channels, base, dim, token_grid, intra_layers, heads)
+                                        for v in VIEWS})
+        self.modality_embedding = nn.Parameter(torch.randn(3,1,dim)*.02)
+        self.anatomy_tokens = nn.Parameter(torch.randn(1,5,dim)*.02)
+        self.anatomy_pos = nn.Parameter(torch.randn(1,5,dim)*.02)
+        self.inter = AnatomyInterModalTransformer(dim, heads, inter_layers)
+        self.cond_proj = nn.ModuleDict({v: nn.Sequential(nn.Linear(len(ids)*dim,dim), nn.LayerNorm(dim),nn.GELU())
+                                        for v,ids in {"2ch":(0,1),"4ch":(0,1,2,3,4),"sa":(0,1,2)}.items()})
+        self.anatomy_indices = {"2ch":(0,1), "4ch":(0,1,2,3,4), "sa":(0,1,2)}
+        self.context_scale = nn.Parameter(torch.tensor(0.1))
+        self.decoder = ProgressiveDecoder(base, dim)
+        self.heads = nn.ModuleDict({v: nn.Conv3d(base,self.num_classes_by_source[v],1) for v in VIEWS})
+        self.deep_heads = nn.ModuleDict({v: nn.ModuleList([
+            nn.Conv3d(base*2,self.num_classes_by_source[v],1),
+            nn.Conv3d(base*4,self.num_classes_by_source[v],1)]) for v in VIEWS})
+        # Encoder auxiliary decoder has SHARED weights, view-specific prediction heads.
+        self.aux_decoder = ProgressiveDecoder(base, dim)
+        self.aux_heads = nn.ModuleDict({v: nn.Conv3d(base,self.num_classes_by_source[v],1) for v in VIEWS})
 
-        self.patch_size = (2, 2, 2)
-        self.patch_grid = (4, 10, 10)
-        self.num_patches = self.patch_grid[0] * self.patch_grid[1] * self.patch_grid[2]
-
-        self.encoders = nn.ModuleDict({
-            src: Encoder3D(in_channels) for src in self.source_order
-        })
-
-        # 每视图独立的 patch 投影：把本视图 encoder 的 bottleneck 特征
-        # 映射到 token 空间，投影分布按本视图学习。
-        self.patch_projs = nn.ModuleDict({
-            src: nn.Conv3d(
-                in_channels=256,
-                out_channels=256,
-                kernel_size=self.patch_size,
-                stride=self.patch_size,
+    def forward(self, x: Tensor, modality_mask: Tensor, full_x: Optional[Tensor] = None) -> Dict:
+        if x.ndim != 5 or x.shape[1] != 3:
+            raise ValueError("x must have shape [B,3,D,H,W]")
+        b = x.shape[0]
+        if modality_mask.shape != (b,3):
+            raise ValueError(f"modality_mask must have shape [{b},3]")
+        present = modality_mask.to(device=x.device, dtype=torch.bool)
+        if not present.any(dim=1).all():
+            raise ValueError("Each sample must contain at least one available view")
+        # Physically zero missing inputs, even if caller passed nonzero content.
+        x = x * present[:, :, None, None, None].to(x.dtype)
+        skip_maps = {}
+        view_tokens = []
+        # Infer dimensions analytically from the three stride-2 ConvBlocks.
+        # Formula for kernel=3, padding=1, stride=2: ceil(size / 2).
+        D, H, W = x.shape[2:]
+        def half_size(shape):
+            return tuple((n + 1) // 2 for n in shape)
+        shape1 = (D, H, W)
+        shape2 = half_size(shape1)
+        shape3 = half_size(shape2)
+        shape4 = half_size(shape3)
+        spatial_shapes = (shape1, shape2, shape3, shape4)
+        feature_channels = (self.base, 2*self.base, 4*self.base, self.dim)
+        patch_shape = tuple((n + 1) // 2 for n in shape4)
+        p = patch_shape[0] * patch_shape[1] * patch_shape[2]
+        for i, view in enumerate(VIEWS):
+            # Sub-batch ONLY valid patients so unavailable views never influence norm statistics.
+            indices = present[:, i].nonzero(as_tuple=True)[0]
+            # Allocate zeros without requiring a dummy forward through absent encoder.
+            # Avoid in-place scatter side effects by using index_copy.
+            if indices.numel() > 0:
+                src_skips, src_tokens = self.encoders[view](x.index_select(0, indices)[:, i:i+1])
+                skips = tuple(torch.zeros((b, *f.shape[1:]), device=f.device, dtype=f.dtype)
+                              .index_copy(0, indices, f) for f in src_skips)
+                tok = torch.zeros((b,p,src_tokens.shape[-1]),device=x.device,dtype=src_tokens.dtype)
+                tok = tok.index_copy(0,indices,src_tokens)
+            else:
+                # No dummy inference (and no duplicate normalization passes).
+                skips = tuple(x.new_zeros((b, c, *shape))
+                              for c, shape in zip(feature_channels, spatial_shapes))
+                tok = x.new_zeros((b, p, self.anatomy_tokens.shape[-1]))
+            skip_maps[view] = skips
+            view_tokens.append(tok + self.modality_embedding[i] * present[:,i,None,None])
+        raw_tokens = torch.stack(view_tokens, dim=1)
+        anatomy_init = (self.anatomy_tokens+self.anatomy_pos).expand(b,-1,-1)
+        fused_tokens, anatomy = self.inter(raw_tokens,anatomy_init,present)
+        logits, aux_logits, deep_logits, pred_tokens = {},{},{},{}
+        for i, view in enumerate(VIEWS):
+            pred_tokens[view] = fused_tokens[:,i]
+            indices = present[:, i].nonzero(as_tuple=True)[0]
+            s1,s2,s3,bottleneck = skip_maps[view]
+            out_size = x.shape[2:]
+            nclasses = self.num_classes_by_source[view]
+            if indices.numel() == 0 and not self.predict_missing:
+                logits[view] = x.new_zeros((b,nclasses,*out_size))
+                aux_logits[view] = x.new_zeros((b,nclasses,*out_size))
+                deep_logits[view] = [x.new_zeros((b,nclasses,*out_size)) for _ in range(2)]
+                continue
+            # Decode only observed samples; avoids propagation of missing-view features.
+            # If predict_missing=True, missing-view decoding is not implemented intentionally.
+            if self.predict_missing:
+                raise NotImplementedError("Missing-view synthesis requires a dedicated reconstruction decoder")
+            sk = [f.index_select(0, indices) for f in (s1,s2,s3,bottleneck)]
+            patch = fused_tokens.index_select(0, indices)[:,i].transpose(1,2)
+            patch = patch.reshape(indices.numel(), self.dim, *patch_shape)
+            context = F.interpolate(
+                patch, size=sk[-1].shape[2:], mode="trilinear", align_corners=False
             )
-            for src in self.source_order
-        })
+            sk[-1] = sk[-1]+self.context_scale*context
+            anat_sel = anatomy.index_select(0,indices)[:,self.anatomy_indices[view],:]
+            cond = self.cond_proj[view](anat_sel.flatten(1))
+            d1,d2,d3 = self.decoder(sk,cond)
+            pred = self.heads[view](d1)
+            pred = F.interpolate(pred,size=out_size,mode="trilinear",align_corners=False)
+            out = x.new_zeros((b,nclasses,*out_size)).index_copy(0,indices,pred)
+            logits[view]=out
+            deep = []
+            for deep_head,feat in zip(self.deep_heads[view],(d2,d3)):
+                dp = F.interpolate(deep_head(feat),size=out_size,mode="trilinear",align_corners=False)
+                deep.append(x.new_zeros((b,nclasses,*out_size)).index_copy(0,indices,dp))
+            deep_logits[view] = deep
+            # mmFormer encoder-side auxiliary regularizer, no anatomy condition.
+            aux1,_,_ = self.aux_decoder([f.index_select(0,indices) for f in (s1,s2,s3,bottleneck)])
+            auxp = F.interpolate(self.aux_heads[view](aux1),size=out_size,mode="trilinear",align_corners=False)
+            aux_logits[view]=x.new_zeros((b,nclasses,*out_size)).index_copy(0,indices,auxp)
+        return {"logits":logits,"aux_logits":aux_logits,"deep_logits":deep_logits,
+                "anatomy_tokens":anatomy,"pred_tokens":pred_tokens,"valid_views":present,
+                "gt_tokens":{}}  # explicit: no teacher is implemented here
 
-        # token 层 modality embedding：颈部融合序列需要区分 patch 来自哪个视图。
-        self.modality_embedding = nn.ParameterDict({
-            "2ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
-            "4ch": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
-            "sa": nn.Parameter(torch.randn(1, 1, 256) * 0.02),
-        })
 
-        # 5 个解剖结构的 [CLS] Tokens (LV_myo, LV_cav, RV_cav, RA, LA)
-        self.anatomy_tokens = nn.Parameter(torch.randn(5, 256) * 0.02)
+def masked_segmentation_loss(result: Dict, targets: Dict[str,Tensor],
+                             aux_weight: float = .2, deep_weight: float = .1) -> Tensor:
+    """Cross entropy over observed views only. Targets: per view [B,D,H,W], integer labels."""
+    present = result["valid_views"]
+    terms = []
+    for i, view in enumerate(VIEWS):
+        valid = present[:,i]
+        if not valid.any():
+            continue
+        target = targets[view][valid].long()
+        loss = F.cross_entropy(result["logits"][view][valid],target)
+        loss = loss + aux_weight * F.cross_entropy(result["aux_logits"][view][valid],target)
+        for pred in result["deep_logits"][view]:
+            loss = loss + deep_weight * F.cross_entropy(pred[valid],target)
+        terms.append(loss)
+    if not terms:
+        raise ValueError("No valid supervised views")
+    return torch.stack(terms).mean()
 
-        # 第一阶段：只利用当前存在的模态更新 anatomy tokens。
-        self.anatomy_update_neck = AnatomyMaskedTransformer(
-            feature_dim=256,
-            num_patches_per_view=self.num_patches,
-            num_anatomy_nodes=5,
-            heads=8,
-            layers=2,
-        )
 
-        # 第二阶段：更新后的 anatomy tokens + 重建后的 patch tokens 做最终跨模态融合。
-        self.transformer_neck = AnatomyMaskedTransformer(
-            feature_dim=256,
-            num_patches_per_view=self.num_patches,
-            num_anatomy_nodes=5,
-            heads=8,
-            layers=2,
-        )
-
-        self.anatomy_indices_by_view = {
-            "2ch": [0, 1],               # LV_myo, LV_cav
-            "4ch": [0, 1, 2, 3, 4],      # 全部 5 个结构
-            "sa": [0, 1, 2],             # LV_myo, LV_cav, RV_cav
-        }
-
-        self.reconstructors = nn.ModuleDict({
-            src: MissingViewReconstructor(
-                num_patches=self.num_patches,
-                feature_dim=256,
-                heads=8,
-                layers=2,
-            )
-            for src in self.source_order
-        })
-
-        # 将连通的解剖 CLS Token 聚合映射为当前切面的条件向量 cond [B, 256]
-        # 各视图连通的解剖结构数量不同，cond 投影保持按视图独立。
-        self.anatomy_cond_proj = nn.ModuleDict({
-            src: nn.Sequential(
-                nn.Linear(len(self.anatomy_indices_by_view[src]) * 256, 256),
-                nn.LayerNorm(256),
-                nn.ReLU(inplace=True),
-            )
-            for src in self.source_order
-        })
-
-        self.gamma_patch = nn.Parameter(torch.ones(1) * 0.1)
-        self.gamma_recon = nn.Parameter(torch.ones(1))
-
-        self.decoder_trunk = SharedDecoderTrunk3D()
-        self.heads = nn.ModuleDict({
-            src: nn.Conv3d(16, self.num_classes_by_source[src], kernel_size=1)
-            for src in self.source_order
-        })
-
-    def encode(self, src: str, x: torch.Tensor):
-        """用视图 src 自己的 encoder 编码。"""
-        return self.encoders[src](x)
-
-    def feature_to_token(self, src: str, b):
-        x_proj = self.patch_projs[src](b)
-        B, C, _, _, _ = x_proj.shape
-        return x_proj.view(B, C, -1).transpose(1, 2)
-
-    def forward(self, x, modality_mask, full_x=None):
-        """
-        x: [B, 3, D, H, W] (masked inputs)
-        modality_mask: [B, 3]
-        full_x: [B, 3, D, H, W] (unmasked full inputs, optional)
-        """
-        B = x.shape[0]
-        P = self.num_patches
-        modality_features = []
-        skips = {}
-
-        # gt_tokens：用各视图自己的 encoder 编码完整输入（no_grad 稳定监督）。
-        # loss 端须用 modality_mask 屏蔽 missing 视图（见 token_distillation_loss）。
-        gt_tokens = {}
-        if full_x is not None:
-            with torch.no_grad():
-                for i, src in enumerate(self.source_order):
-                    xi_full = full_x[:, i : i + 1]
-                    _, _, _, b_full = self.encode(src, xi_full)
-                    gt_token = self.feature_to_token(src, b_full) + self.modality_embedding[src]
-                    gt_tokens[src] = gt_token
-
-        anatomy_nodes_init = self.anatomy_tokens.unsqueeze(0).expand(B, -1, -1)
-
-        raw_modality_tokens = []
-        modality_present = []
-
-        for i, src in enumerate(self.source_order):
-            present = modality_mask[:, i].bool()
-            xi = x[:, i : i + 1]
-
-            s1, s2, s3, b = self.encode(src, xi)
-            skips[src] = (s1, s2, s3, b)
-
-            token = self.feature_to_token(src, b) + self.modality_embedding[src]
-            raw_modality_tokens.append(token)
-            modality_present.append(present)
-
-        raw_modality_nodes = torch.cat(raw_modality_tokens, dim=1)
-
-        # ------------------------------------------------------------------
-        # 第一阶段：从当前样本实际存在的模态更新 anatomy tokens。
-        # ------------------------------------------------------------------
-        anatomy_context_input = torch.cat(
-            [raw_modality_nodes, anatomy_nodes_init],
-            dim=1,
-        )
-
-        anatomy_key_padding_mask = torch.zeros(
-            B,
-            3 * P + self.transformer_neck.num_anatomy,
-            dtype=torch.bool,
-            device=x.device,
-        )
-        for i, present in enumerate(modality_present):
-            missing_patch_mask = (~present).unsqueeze(1).expand(B, P)
-            start = i * P
-            end = (i + 1) * P
-            anatomy_key_padding_mask[:, start:end] = missing_patch_mask
-
-        anatomy_context_out = self.anatomy_update_neck(
-            anatomy_context_input,
-            key_padding_mask=anatomy_key_padding_mask,
-        )
-        anatomy_nodes = anatomy_context_out[:, 3 * P :, :]  # [B, 5, 256]
-
-        # ------------------------------------------------------------------
-        # 第二阶段：MAE 式缺失视图重建
-        # ------------------------------------------------------------------
-        recon_memory = torch.cat([raw_modality_nodes, anatomy_nodes], dim=1)
-        recon_memory_kpm = anatomy_key_padding_mask
-
-        modality_features = []
-        for i, src in enumerate(self.source_order):
-            present = modality_present[i]
-            token = raw_modality_tokens[i].clone()
-            missing = ~present
-
-            if missing.any():
-                recon = self.reconstructors[src](
-                    recon_memory,
-                    memory_key_padding_mask=recon_memory_kpm,
-                )
-                token[missing] = self.gamma_recon * recon[missing]
-
-            modality_features.append(token)
-
-        modality_nodes = torch.cat(modality_features, dim=1)
-
-        # ------------------------------------------------------------------
-        # 最终跨模态 Transformer 融合。
-        # ------------------------------------------------------------------
-        tokens = torch.cat([modality_nodes, anatomy_nodes], dim=1)
-        neck_out = self.transformer_neck(tokens)
-
-        updated_patches = neck_out[:, : 3 * P, :].view(B, 3, P, 256)
-        updated_anatomy = neck_out[:, 3 * P :, :]
-
-        outputs = {}
-        pred_tokens = {}
-        for i, src in enumerate(self.source_order):
-            s1, s2, s3, b = skips[src]
-            target_shape = b.shape[2:]
-
-            view_patches = updated_patches[:, i]
-            pred_tokens[src] = view_patches
-
-            patch_feat = view_patches.transpose(1, 2).view(B, 256, *self.patch_grid)
-            patch_context_feat = F.interpolate(patch_feat, size=target_shape, mode="trilinear", align_corners=False)
-            b = b + self.gamma_patch * patch_context_feat
-
-            sel_indices = self.anatomy_indices_by_view[src]
-            sel_tokens = updated_anatomy[:, sel_indices, :]
-            cond = self.anatomy_cond_proj[src](sel_tokens.reshape(B, -1))
-
-            feat = self.decoder_trunk(s1, s2, s3, b, cond=cond)
-            outputs[src] = self.heads[src](feat)
-
-        return {
-            "logits": outputs,
-            "pred_tokens": pred_tokens,
-            "gt_tokens": gt_tokens,
-        }
+if __name__ == "__main__":
+    torch.manual_seed(1)
+    model = MMFormerAnatomy(base=8, dim=32, heads=4, token_grid=(2,2,2), intra_layers=1, inter_layers=1)
+    x = torch.randn(2,3,16,32,32)
+    mask = torch.tensor([[1,0,1],[0,1,0]],dtype=torch.bool)
+    output = model(x,mask)
+    for view, pred in output["logits"].items():
+        print(view, tuple(pred.shape))
+    targets = {v:torch.randint(0,c,(2,16,32,32)) for v,c in model.num_classes_by_source.items()}
+    loss = masked_segmentation_loss(output,targets)
+    loss.backward()
+    print("forward/backward OK, loss=",round(loss.item(),4))
