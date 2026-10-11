@@ -1,46 +1,62 @@
 # MultiCMR
 
-2CH/4CH 使用完整的 **2D+t** 序列，SAX 使用 3D 输入。三种模态通过原生 patch tokens、可学习 fusion tokens 和 5 个 anatomy tokens 融合，并保留缺失模态掩码。
+2CH/4CH 使用以目标帧为中心的 **5 帧时间窗**，2D encoder/decoder 只预测中心帧；每个训练样本同时包含同病例 SAX 体积。原生 patch、fusion tokens、anatomy tokens 和缺失模态掩码保留，SAX 使用 3D encoder/decoder。
 
-| 模态 | 预处理数组 | 模型输入 | 分割 logits |
-| --- | --- | --- | --- |
-| 2CH | `[64,128,128] = [T,H,W]` | `[B,1,64,128,128]` | `[B,3,64,128,128]` |
-| 4CH | `[64,128,128] = [T,H,W]` | `[B,1,64,128,128]` | `[B,6,64,128,128]` |
-| SAX (`sa`) | `[128,128,128] = [D,H,W]` | `[B,1,128,128,128]` | `[B,4,128,128,128]` |
+| 模态 | 缓存图像 | 缓存标签 | 批量输入 | 分割 logits |
+| --- | --- | --- | --- | --- |
+| 2CH | `[5,128,128]` | `[128,128]` | `[B,1,5,128,128]` | `[B,3,128,128]` |
+| 4CH | `[5,128,128]` | `[128,128]` | `[B,1,5,128,128]` | `[B,6,128,128]` |
+| SAX | `[128,128,128]` | `[128,128,128]` | `[B,1,128,128,128]` | `[B,4,128,128,128]` |
 
-原始长轴 NIfTI 使用 `[H,W,T]`（也支持 `[H,W,1,T]`），先转换为 `[T,H,W]`，再重采样到 64 帧。原始 SAX 数组最后一轴移到最前；保留原有 SAX 堆叠语义，不另外推断或拆分心动周期。图像使用非零区域 z-score 和线性插值，标签使用最近邻插值。增强对整段长轴序列使用一致的空间翻转，不翻转时间顺序。
+## 预处理与样本
 
 ```bash
 python -m pip install -r requirements.txt
 bash run.sh preprocess
+# 自定义正奇数窗口长度 K，H/W 是空间尺寸
+LAX_SIZE="3 128 128" bash run.sh preprocess
+```
+
+必须重新预处理。旧 matched.yaml 和完整序列训练缓存不能直接用于窗口训练。原始长轴输入支持 `[H,W,T]` 和 `[H,W,1,T]`，保留原始帧数，仅重采样 H/W；图像使用非零区域 z-score 和双线性插值，标签使用最近邻。时间窗边界复制首尾帧，例如 K=5、中心帧 0 对应 `[0,0,0,1,2]`。不沿时间插值或重采样到 64 帧。
+
+每病例生成 `max(T_2ch,T_4ch)` 个样本。两视图按归一化序列位置最近邻配对，中心索引为 `round(i*(T_view-1)/(N-1))`；所有原始帧均被覆盖，较短视图可能重复使用某些中心帧。这只是序列位置配对，不保证生理心动相位一致。应确认原始长轴最后一轴确实为连续时间，混合切片/多序列堆叠必须先整理。
+
+文件写入 `preprocess/processed/{split}/{case_id}/`：
+
+- `2ch_w0000.npz` / `4ch_w0000.npz`：窗口图像、中心帧标签、frame_indices、center_index、原始 affine/shape。
+- `sa_full.npz`：每病例仅保存一份 SAX，所有窗口记录引用它。
+- `2ch_full.npz` / `4ch_full.npz`：保留所有原始时间帧的空间重采样结果，用于病例级推理和序列重建。
+
+`matched.yaml` 的 `splits` 是窗口级记录，`case_splits` 是病例级完整序列记录。先沿用原始患者 train/val/test 划分，再拆窗口，避免同一病例泄漏到不同集合。无标签 test 也会生成窗口。`--manifest-only` 已移除，训练使用离线拆分缓存。
+
+SAX 继续使用原有预处理：最后一轴移到最前并缩放至指定 DHW，不在本次改动中推断或拆分其心动周期；使用前仍须核对原始堆叠是否具有预期语义。
+
+## 网络与训练
+
+```bash
 bash run.sh train
+NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
+```
+
+模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 转成 `[B,K,H,W]` 输入 2D encoder，亦支持直接传入后者。`temporal_size` 配置现在表示正奇数窗口长度，默认 5。两个长轴视图仍各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。辅助头、深监督头也只监督长轴中心帧。
+
+默认尺寸下，每个长轴窗口生成 256 个 patch tokens，SAX 为 4096 个；1×1 patch embedding、空间位置编码、模态内 Transformer、联合 attention、4096 个 fusion tokens 和 5 个 anatomy tokens 保留。时间相对位置由窗口通道顺序表达。共享三维 fusion 特征沿深度平均后投影到长轴二维网格。attention 使用 query 分块和训练 checkpoint 重算。
+
+训练仍均匀采样 7 种非空模态掩码；每条数据包含 SAX，但随机掩码可将它屏蔽。验证使用完整模态。缺失视图不编码、不作为 attention key/value、不计入监督。长轴 Dice+CE、边界损失及指标为中心帧二维计算；SAX 为三维计算。窗口内所有帧与中心标签采用一致的空间翻转。
+
+日志中的训练/验证数量现在是**窗口数**。一个 epoch 遍历所有窗口，步骤数比原来的病例级 epoch 大；SAX 在每个窗口参与监督。训练脚本的 val Dice 是窗口加权统计（SAX 也按窗口计数），与独立 test.py 的病例级重建分数不同，帧数不同的病例权重不同。原来的 200 epochs 不再代表相同训练预算，请结合窗口总数调整 EPOCHS。
+
+## 完整序列评估
+
+```bash
 bash run.sh test
-```
-
-预处理默认写入 `preprocess/processed/{train,val,test}/*.npz` 和 `preprocess/matched.yaml`。每个 NPZ 保存 image、可选 label、原始 affine/shape、view 和布局信息。也可以只生成原始路径清单，由 Dataset 在线执行相同处理：
-
-```bash
-python -m preprocess.preprocess --manifest-only
-```
-
-训练、验证和推理均输入全部 64 帧，不随机抽帧。模型接收 `{'2ch': tensor, '4ch': tensor, 'sa': tensor}` 与 `[B,3]` 模态掩码。2CH/4CH 将 `[B,C,T,H,W]` 展开为 `[B*T,C,H,W]`，逐帧经过共享的 2D encoder、1×1 patch embedding、空间位置编码和模态内 Transformer。随后恢复时间维度，加入可学习的时间位置编码，按时间顺序拼接为 `[B,T*P2D,dim]`。两个长轴视图使用各自的 encoder 参数。
-
-默认每帧的 patch 网格为 `16×16`，每个长轴序列保留 `64×16×16 = 16384` 个 tokens；SAX 的 3D 网格为 `16×16×16 = 4096` 个 tokens。拼接后进行跨帧、跨模态的联合 attention，包含 4096 个 fusion tokens 和 5 个 anatomy tokens，不要求三个模态 token 数量相同。`token_grid` 控制可学习位置网格的初始大小，不用于池化或削减原生 patches。
-
-长序列 attention 按 query 分块计算，每个 query 仍关注全部可用 keys；训练时通过 checkpoint 重算 attention 分块来控制中间矩阵显存。这保留全局 attention 和所有 patch，但完整 2D+t 训练仍比单帧需要更多计算和显存。
-
-解码时，融合后的长轴 tokens 还原成 `[B,dim,T,h,w]`，使用 2D decoder 逐帧解码，再恢复 `[B,classes,T,H,W]`。Fusion 特征沿 SAX 深度取均值后广播到各帧，避免把 SAX 深度当作长轴时间；各帧自身的融合 tokens 保留时序上下文。SAX 继续使用 3D encoder/decoder。解剖 token 注入、辅助分割头和深监督结构保留。
-
-训练保持原有 7 种非空模态掩码随机采样，验证使用全模态。缺失模态不进入 encoder、不作为 attention key/value，也不计入损失和指标。Dice+CE、边界损失和指标对长轴逐帧计算后平均，边界距离只在帧内计算；SAX 使用 3D 计算。辅助/深监督默认权重为 `--aux-weight 0.2` 和 `--deep-weight 0.1`，边界损失可通过 `--boundary-weight 0` 关闭。
-
-独立评估 `test.py` 每种模态组合执行一次完整序列 forward，直接输出长轴 `[64,H,W]` 与 SAX `[128,128,128]` 分割。支持 `full`、`random`、`both`、`all-seven` 模态组合；`--split test` 无标签也可导出预测。
-
-```bash
-python test.py --checkpoint checkpoints/best_model_3d_multihead.pth --split val --eval-mode all-seven
 SPLIT=test bash run.sh test
+EVAL_MODE=all-seven bash run.sh test
 python -m unittest discover -s tests -v
 ```
 
-导出 NIfTI 使用模型坐标和单位 affine：长轴为 `[H,W,1,T]`，SAX 为 `[H,W,D]`，不直接代表原始物理坐标。`calculate_lv_ef.py` 要求恢复到原始 SAX 布局和 spacing 的分割，不能直接使用这些模型坐标导出文件。
+test.py 读取病例级完整序列，构造与预处理一致的成对时间窗，每次加同一份 SAX。一个病例在同一评估场景的所有窗口固定使用相同掩码。长轴中心帧预测按原始时间顺序重建，重复中心帧先平均类别概率再 argmax；SAX 对所有窗口的类别概率取平均后 argmax，每病例只评估一次。SAX-only 场景只执行一次网络。为控制 SAX 和 attention 显存，当前推理按窗口顺序执行，完整病例比原先一次全序列 forward 更慢。
 
-尺寸选项改为 `--lax-size T H W` 和 `--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。默认从 YAML/checkpoint 读取各模态尺寸；缓存尺寸有变化时需重新预处理。旧 `--input-size`、三路统一 3D encoder 的 checkpoint，以及不含时间位置编码的单帧 checkpoint 不兼容，需要用新结构重新训练。新 checkpoint 保存各模态尺寸、时间位置编码长度和完整模型配置。原先未生效的缺失模态合成/token 重建参数已移除。
+支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
+
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_lax_3d_sax_v1`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。

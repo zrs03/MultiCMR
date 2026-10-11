@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full-cine 2D+t long-axis + 3D SAX segmentation.
+# Center-window long-axis + 3D SAX segmentation.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -56,9 +56,9 @@ case "$MODE" in
   -h|--help)
     cat <<'EOF'
 Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
-  preprocess: cache 2CH/4CH [64,128,128] (T,H,W), SAX [128,128,128] (D,H,W)
-  train: complete LAX sequences with 2D+t encoding; full-sequence validation
-  test: full LAX cines in one sequence forward; default split=val
+  preprocess: cache 2CH/4CH [5,128,128] windows, center labels [128,128], SAX [128,128,128] (D,H,W)
+  train: paired LAX windows + shared SAX; center-frame supervision
+  test: sliding windows reconstruct native LAX frames; average SAX probabilities; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
   CHECKPOINT, DEVICE, BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, NUM_GPUS, GPU_DEVICES,
   LAX_SIZE, SAX_SIZE, SPLIT, EVAL_MODE.

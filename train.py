@@ -188,20 +188,20 @@ def run_one_epoch(
                 logits = outputs['logits'][view][valid]
                 target = targets[view][valid]
                 classes = num_classes_by_source[view]
-                loss = dice_ce_loss_per_sample(logits, target, classes, framewise=view != 'sa')
+                loss = dice_ce_loss_per_sample(logits, target, classes, framewise=False)
                 if boundary_weight > 0:
                     loss = loss + boundary_weight * boundary_loss_per_sample(
-                        logits, target, classes, boundary_downsample, boundary_max_distance, framewise=view != 'sa')
+                        logits, target, classes, boundary_downsample, boundary_max_distance, framewise=False)
                 if is_train and aux_weight > 0:
                     loss = loss + aux_weight * dice_ce_loss_per_sample(
-                        outputs['aux_logits'][view][valid], target, classes, framewise=view != 'sa')
+                        outputs['aux_logits'][view][valid], target, classes, framewise=False)
                 if is_train and deep_weight > 0:
                     for pred in outputs['deep_logits'][view]:
-                        loss = loss + deep_weight * dice_ce_loss_per_sample(pred[valid], target, classes, framewise=view != 'sa')
+                        loss = loss + deep_weight * dice_ce_loss_per_sample(pred[valid], target, classes, framewise=False)
                 loss_sum = loss_sum + loss.sum()
                 count += n
                 with torch.no_grad():
-                    dice, iou = multiclass_dice_iou(logits, target, classes, framewise=view != 'sa')
+                    dice, iou = multiclass_dice_iou(logits, target, classes, framewise=False)
                     stats[view] += torch.stack((dice * n, iou * n, logits.new_tensor(n)))
             batch_loss = loss_sum / count
             if is_train:
@@ -221,7 +221,7 @@ def run_one_epoch(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train full-cine 2D+t LAX + 3D SAX with masked token fusion")
+    parser = argparse.ArgumentParser(description="Train center-window LAX + 3D SAX with masked token fusion")
     parser.add_argument("--split-yaml", type=str, default="preprocess/matched.yaml", help="Path to preprocessed split YAML")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Directory to save checkpoints and logs")
     parser.add_argument("--source-order", nargs="+", default=None, help="List of sequence sources (defaults to YAML or [2ch 4ch sa])")
@@ -231,7 +231,7 @@ def main():
         default=None,
         help="JSON string specifying number of classes per source (defaults to YAML)",
     )
-    parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH T H W (default 64 128 128 or YAML)')
+    parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH K H W (default 5 128 128 or YAML)')
     parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX D H W (default 128 128 128 or YAML)')
     parser.add_argument('--base', type=int, default=16)
     parser.add_argument('--dim', type=int, default=128)
@@ -316,7 +316,7 @@ def main():
     )
 
     if is_master_proc(rank):
-        print(f"[MultiCMR] Cases: Train={len(train_cases)}, Val={len(val_cases)}")
+        print(f"[MultiCMR] Window samples: Train={len(train_cases)}, Val={len(val_cases)}")
         print(f"[MultiCMR] Source Order: {source_order}")
         print(f"[MultiCMR] Num Classes: {num_classes_by_source}")
 
@@ -331,7 +331,7 @@ def main():
                         inter_layers=args.inter_layers,
                         temporal_size=max(output_sizes[v][0] for v in ('2ch', '4ch')))
     if is_master_proc(rank):
-        print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=full 2D+t cine')
+        print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=center-window + shared SAX')
 
     train_dataset = MultiSourceNiftiDataset3D(
         cases=train_cases,
@@ -394,7 +394,7 @@ def main():
 
     if is_master_proc(rank):
         with open(log_path, "w", encoding="utf-8") as file:
-            file.write(f"2D+t LAX + 3D SAX Training Log (World size: {world_size})\n")
+            file.write(f"Center-window LAX + 3D SAX Training Log (World size: {world_size})\n")
 
     for epoch in range(1, args.epochs + 1):
         if is_distributed and train_sampler is not None:
@@ -450,7 +450,7 @@ def main():
                         "num_classes_by_source": num_classes_by_source,
                         "output_sizes": output_sizes,
                         "model_config": model_config,
-                        "architecture": "temporal_2d_lax_3d_sax_v1",
+                        "architecture": "center_window_lax_3d_sax_v1",
                     },
                     best_ckpt,
                 )

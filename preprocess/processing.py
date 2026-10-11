@@ -1,4 +1,4 @@
-"""Shared offline/online preprocessing; long-axis axis 0 is always time."""
+"""Native-frame spatial preprocessing and centered-window cache loading."""
 from pathlib import Path
 
 import nibabel as nib
@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 VIEWS = ('2ch', '4ch', 'sa')
-DEFAULT_OUTPUT_SIZES = {'2ch': (64, 128, 128), '4ch': (64, 128, 128),
+DEFAULT_OUTPUT_SIZES = {'2ch': (5, 128, 128), '4ch': (5, 128, 128),
                         'sa': (128, 128, 128)}
 
 
@@ -19,6 +19,8 @@ def validate_output_sizes(output_sizes=None):
         if len(size) != 3 or any(int(n) != n or n <= 0 for n in size):
             raise ValueError(f'{view}: expected three positive dimensions, got {size}')
         sizes[view] = tuple(int(n) for n in size)
+    if sizes['2ch'] != sizes['4ch'] or sizes['2ch'][0] % 2 != 1:
+        raise ValueError('LAX sizes must agree and use a positive odd window length')
     return sizes
 
 
@@ -44,7 +46,7 @@ def resize_array(array, size, is_label=False):
 
 
 def prepare_nifti(path, view, output_size, is_label=False):
-    """Resample time and space for LAX; labels always use nearest neighbors."""
+    """Preserve LAX time; resize only space. SAX retains legacy stack resizing."""
     nii = nib.load(str(path))
     array = nii.get_fdata(dtype=np.float32)
     original_shape = array.shape
@@ -55,16 +57,25 @@ def prepare_nifti(path, view, output_size, is_label=False):
         nonzero = array[np.abs(array) > 1e-8]
         if nonzero.size:
             array = (array - nonzero.mean()) / max(float(nonzero.std()), 1e-8)
-    array = resize_array(array, output_size, is_label=is_label)
+    # Preserve native LAX frames; resize spatial dimensions independently.
+    if view != 'sa':
+        tensor = torch.from_numpy(np.ascontiguousarray(array)).float()[:, None]
+        kwargs = {} if is_label else {'align_corners': False}
+        array = F.interpolate(tensor, size=tuple(output_size[-2:]),
+                              mode='nearest' if is_label else 'bilinear', **kwargs)[:, 0].numpy()
+    else:
+        array = resize_array(array, output_size, is_label=is_label)
     return array.astype(np.int64 if is_label else np.float32), nii.affine, original_shape
 
 
-def load_view(path, view, output_size, is_label=False):
+def load_view(path, view, output_size, is_label=False, complete_cine=False):
     """Read a raw NIfTI or a preprocessed NPZ without transposing it twice."""
     if Path(path).suffix != '.npz':
+        if not complete_cine:
+            raise ValueError('Window samples require offline NPZ caches; rerun preprocessing')
         return prepare_nifti(path, view, output_size, is_label)
     with np.load(path, allow_pickle=False) as data:
-        expected_layout = 'THW' if view != 'sa' else 'DHW'
+        expected_layout = ('THW' if complete_cine else 'KHW') if view != 'sa' else 'DHW'
         if str(data['view']) != view or str(data['layout']) != expected_layout:
             raise ValueError(f'Invalid view/layout in {path}')
         key = 'label' if is_label else 'image'
@@ -72,7 +83,22 @@ def load_view(path, view, output_size, is_label=False):
             raise ValueError(f'{path} has no {key}')
         array = data[key].copy()
         affine, original_shape = data['affine'].copy(), tuple(data['original_shape'])
-    if tuple(array.shape) != tuple(output_size):
+    expected = (array.shape[0], *output_size[-2:]) if complete_cine and view != 'sa' else (output_size[-2:] if is_label and view != 'sa' else output_size)
+    if tuple(array.shape) != tuple(expected):
         raise ValueError(f'{path}: cached size {array.shape} != requested {tuple(output_size)}; '
                          'regenerate preprocessing with the requested per-view sizes')
     return array.astype(np.int64 if is_label else np.float32), affine, original_shape
+
+
+def window_indices(center, length, window_size):
+    if window_size < 1 or window_size % 2 != 1 or not 0 <= center < length:
+        raise ValueError('Invalid center, sequence length or odd window size')
+    radius = window_size // 2
+    return np.clip(np.arange(center - radius, center + radius + 1), 0, length - 1)
+
+
+def paired_centers(lengths):
+    """Nearest normalized sequence positions; not a physiological phase alignment."""
+    count = max(lengths.values())
+    return [{v: int(np.rint(i * (n - 1) / max(count - 1, 1))) for v, n in lengths.items()}
+            for i in range(count)]

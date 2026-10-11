@@ -10,7 +10,7 @@ if __package__ in (None, ''):
 
 import numpy as np
 import yaml
-from preprocess.processing import prepare_nifti, validate_output_sizes
+from preprocess.processing import prepare_nifti, validate_output_sizes, window_indices, paired_centers
 
 SOURCE_FOLDERS = {'2ch': '2CH', '4ch': '4CH', 'sa': 'SAX'}
 SPLITS = {'train': '_TR', 'val': '_VAL', 'test': '_TST'}
@@ -34,31 +34,25 @@ def main():
     parser.add_argument('--data-root', default='rawdata/CINE_MULTI')
     parser.add_argument('--output-yaml', default='preprocess/matched.yaml')
     parser.add_argument('--output-dir', default='preprocess/processed')
-    parser.add_argument('--lax-size', nargs=3, type=int, default=(64, 128, 128), metavar=('T', 'H', 'W'))
+    parser.add_argument('--lax-size', nargs=3, type=int, default=(5, 128, 128), metavar=('K', 'H', 'W'))
     parser.add_argument('--sax-size', nargs=3, type=int, default=(128, 128, 128), metavar=('D', 'H', 'W'))
-    parser.add_argument('--manifest-only', action='store_true',
-                        help='Keep raw NIfTI paths; the Dataset applies the same preprocessing online')
     args = parser.parse_args()
     sizes = validate_output_sizes({'2ch': args.lax_size, '4ch': args.lax_size, 'sa': args.sax_size})
     root, output_dir = Path(args.data_root).resolve(), Path(args.output_dir).resolve()
-    splits = {}
+    splits, case_splits = {}, {}
     for split, suffix in SPLITS.items():
         files = {v: {k: collect_files(root, v, suffix, k) for k in ('image', 'anno')}
                  for v in SOURCE_FOLDERS}
         ids = set.intersection(*(set(files[v]['image']) for v in SOURCE_FOLDERS))
         if split != 'test':
             ids &= set.intersection(*(set(files[v]['anno']) for v in SOURCE_FOLDERS))
-        records = []
+        records, case_records = [], []
         for case_id in sorted(ids, key=int):
             record = {'case_id': case_id}
+            cached = {}
             for view in SOURCE_FOLDERS:
                 image_path = files[view]['image'][case_id]
                 label_path = files[view]['anno'].get(case_id) if split != 'test' else None
-                if args.manifest_only:
-                    record[view] = {'image': image_path}
-                    if label_path:
-                        record[view]['anno'] = label_path
-                    continue
                 image, affine, shape = prepare_nifti(image_path, view, sizes[view])
                 arrays = dict(image=image, affine=affine, original_shape=np.array(shape),
                               view=np.array(view), layout=np.array('DHW' if view == 'sa' else 'THW'))
@@ -70,22 +64,45 @@ def main():
                     if label.min() < 0 or label.max() >= classes:
                         raise ValueError(f'Invalid labels for {case_id}/{view}')
                     arrays['label'] = label.astype(np.uint8)
-                destination = output_dir / split / f'{view}_{case_id}.npz'
+                cached[view] = arrays
+                destination = output_dir / split / case_id / f'{view}_full.npz'
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(destination, **arrays)
                 record[view] = {'image': str(destination)}
                 if label_path:
                     record[view]['anno'] = str(destination)
-            records.append(record)
-            print(f'{split}: {case_id}', flush=True)
+            case_records.append(record)
+            centers = paired_centers({v: cached[v]['image'].shape[0] for v in ('2ch', '4ch')})
+            for index, center in enumerate(centers):
+                sample = {'case_id': case_id, 'sample_id': f'{case_id}_w{index:04d}',
+                          'center_indices': center, 'sa': record['sa']}
+                for view in ('2ch', '4ch'):
+                    full = cached[view]
+                    indices = window_indices(center[view], full['image'].shape[0], sizes[view][0])
+                    arrays = dict(image=full['image'][indices], affine=full['affine'],
+                                  original_shape=full['original_shape'], view=np.array(view),
+                                  layout=np.array('KHW'), center_index=np.array(center[view]),
+                                  frame_indices=indices)
+                    if 'label' in full:
+                        arrays['label'] = full['label'][center[view]]
+                    destination = output_dir / split / case_id / f'{view}_w{index:04d}.npz'
+                    np.savez_compressed(destination, **arrays)
+                    sample[view] = {'image': str(destination)}
+                    if 'label' in arrays:
+                        sample[view]['anno'] = str(destination)
+                records.append(sample)
+            print(f'{split}: {case_id}, {len(centers)} paired windows + shared SAX', flush=True)
         splits[split] = records
+        case_splits[split] = case_records
     output = {'dataset_info': {
+        'schema': 'center_window_v1', 'window_size': sizes['2ch'][0],
+        'pairing': 'nearest_normalized_position', 'padding': 'edge',
         'data_root': str(root), 'source_order': list(SOURCE_FOLDERS),
         'num_classes_by_source': {'2ch': 3, '4ch': 6, 'sa': 4},
         'output_sizes': {v: list(s) for v, s in sizes.items()},
-        'array_layouts': {'2ch': 'THW', '4ch': 'THW', 'sa': 'DHW'},
+        'array_layouts': {'2ch': 'KHW', '4ch': 'KHW', 'sa': 'DHW'},
         'sample_counts': {split: len(records) for split, records in splits.items()},
-    }, 'splits': splits}
+    }, 'splits': splits, 'case_splits': case_splits}
     destination = Path(args.output_yaml)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(yaml.safe_dump(output, sort_keys=False, allow_unicode=True), encoding='utf-8')

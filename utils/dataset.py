@@ -40,12 +40,14 @@ class CaseItem:
     case_id: str
     image_paths: Dict[str, str]
     label_paths: Dict[str, str]
+    sample_id: str = ""
 
 
 def load_cases_from_yaml(
     yaml_path: str,
     split: str = "train",
     data_root_override: str = None,
+    complete_cine: bool = False,
 ) -> Tuple[List[CaseItem], dict]:
     """
     Load matched 2CH / 4CH / SAX cases from YAML.
@@ -106,6 +108,9 @@ def load_cases_from_yaml(
         {},
     )
 
+    if dataset_info.get('schema') != 'center_window_v1':
+        raise ValueError('Old cine manifest: rerun bash run.sh preprocess for center-window samples')
+
     # --------------------------------------------------------
     # Resolve data root
     # --------------------------------------------------------
@@ -121,7 +126,7 @@ def load_cases_from_yaml(
         root = os.path.abspath(root)
 
     splits_dict = data.get(
-        "splits",
+        "case_splits" if complete_cine else "splits",
         {},
     )
 
@@ -229,6 +234,7 @@ def load_cases_from_yaml(
                 case_id=case_id,
                 image_paths=image_paths,
                 label_paths=label_paths,
+                sample_id=str(rec.get("sample_id", case_id)),
             )
         )
 
@@ -244,6 +250,7 @@ def load_cases_from_yaml(
         ),
         "data_root": root,
         "output_sizes": dataset_info.get("output_sizes"),
+        "schema": dataset_info["schema"],
         "split": split,
         "num_cases": len(cases),
     }
@@ -258,14 +265,15 @@ def load_cases_from_yaml(
 class MultiSourceNiftiDataset3D(Dataset):
     """LAX [1,T,H,W] and SAX [1,D,H,W], with complete per-view labels.
 
-    All frames are retained for 2D+t training, validation and inference.
+    Training/validation use cached windows and center labels. complete_cine is for reconstruction at test time.
     The historical class name is retained for existing imports.
     """
 
     def __init__(self, cases: Sequence[CaseItem], output_sizes=None,
                  source_num_classes: Dict[str, int] = None, augment: bool = False,
-                 load_anno: bool = True):
+                 load_anno: bool = True, complete_cine: bool = False):
         self.cases = list(cases)
+        self.complete_cine = complete_cine
         self.output_sizes = validate_output_sizes(output_sizes)
         self.source_order = VIEWS
         self.source_num_classes = source_num_classes or {'2ch': 3, '4ch': 6, 'sa': 4}
@@ -279,14 +287,14 @@ class MultiSourceNiftiDataset3D(Dataset):
         images, masks, affines, original_shapes = {}, {}, {}, {}
         for source in self.source_order:
             size = self.output_sizes[source]
-            image, affine, original_shape = load_view(item.image_paths[source], source, size)
+            image, affine, original_shape = load_view(item.image_paths[source], source, size, complete_cine=self.complete_cine)
             affines[source] = torch.as_tensor(affine.copy(), dtype=torch.float32)
             original_shapes[source] = tuple(int(n) for n in original_shape)
             label = None
             if self.load_anno:
                 if source not in item.label_paths:
                     raise ValueError(f'Annotation missing for case={item.case_id}, source={source}')
-                label, _, label_shape = load_view(item.label_paths[source], source, size, is_label=True)
+                label, _, label_shape = load_view(item.label_paths[source], source, size, is_label=True, complete_cine=self.complete_cine)
                 if tuple(label_shape) != original_shapes[source]:
                     raise ValueError(f'Image/label shape mismatch: case={item.case_id}, source={source}')
                 if label.min() < 0 or label.max() >= self.source_num_classes[source]:
@@ -298,12 +306,13 @@ class MultiSourceNiftiDataset3D(Dataset):
                     if np.random.rand() < .5:
                         image = np.flip(image, axis=axis)
                         if label is not None:
-                            label = np.flip(label, axis=axis)
+                            label_axis = axis - 1 if source != 'sa' and not self.complete_cine else axis
+                            label = np.flip(label, axis=label_axis)
             images[source] = torch.from_numpy(np.ascontiguousarray(image)).float().unsqueeze(0)
             if label is not None:
                 masks[source] = torch.from_numpy(np.ascontiguousarray(label)).long()
         return {
-            'image': images, 'masks': masks, 'case_id': item.case_id,
+            'image': images, 'masks': masks, 'case_id': item.case_id, 'sample_id': item.sample_id,
             'image_paths': item.image_paths, 'label_paths': item.label_paths,
             'affines': affines, 'original_shapes': original_shapes,
             'has_anno': self.load_anno,

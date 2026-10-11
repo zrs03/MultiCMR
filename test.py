@@ -7,8 +7,7 @@ Example:
   python test.py --split-yaml preprocess/matched.yaml \
     --checkpoint checkpoints/best_model_3d_multihead.pth --split test
 
-LAX enters the network as a complete cine with framewise 2D encoding and
-temporal patch concatenation. Exports use model space: LAX [H,W,1,T] and SAX [H,W,D].
+LAX enters as centered temporal windows; outputs are reconstructed to native frame counts. Exports use model space: LAX [H,W,1,T] and SAX [H,W,D].
 """
 from __future__ import annotations
 import argparse
@@ -133,7 +132,7 @@ def main():
     pa.add_argument('--split', choices=['train','val','test'], default='val')
     pa.add_argument('--checkpoint', required=True)
     pa.add_argument('--output-dir', default='results_mmformer')
-    pa.add_argument('--lax-size', type=int, nargs=3, default=None, help='2CH/4CH T H W')
+    pa.add_argument('--lax-size', type=int, nargs=3, default=None, help='2CH/4CH K H W')
     pa.add_argument('--sax-size', type=int, nargs=3, default=None, help='SAX D H W')
     pa.add_argument('--source-order', nargs='+', default=None)
     pa.add_argument('--num-classes-json', default=None)
@@ -162,7 +161,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     state = checkpoint.get('model', checkpoint.get('state_dict', checkpoint))
     state = {k.removeprefix('module.'): v for k,v in state.items()}
-    cases, info = load_cases_from_yaml(args.split_yaml, split=args.split)
+    cases, info = load_cases_from_yaml(args.split_yaml, split=args.split, complete_cine=True)
     order = list(args.source_order or checkpoint.get('source_order') or info['source_order'])
     if order != list(VIEWS):
         raise ValueError(f'MMFormerAnatomy expects source_order {VIEWS}, found {order}')
@@ -170,28 +169,18 @@ def main():
                checkpoint.get('num_classes_by_source') or info['num_classes_by_source'])
     classes = {k:int(v) for k,v in classes.items()}
     sizes = validate_output_sizes(checkpoint.get('output_sizes') or info.get('output_sizes'))
+    if sizes != validate_output_sizes(info.get('output_sizes')):
+        raise ValueError('Checkpoint and preprocessing sizes differ; use matching window caches')
     if args.lax_size:
         sizes.update({'2ch': args.lax_size, '4ch': args.lax_size})
     if args.sax_size:
         sizes['sa'] = args.sax_size
     sizes = validate_output_sizes(sizes)
-    first_weight = state.get('encoders.2ch.c1.conv.0.weight')
-    if first_weight is not None and first_weight.ndim != 4:
-        raise ValueError('This checkpoint uses a 3D LAX encoder. Retrain with the 2D+t architecture.')
-    if 'encoders.2ch.temporal_pos' not in state:
-        raise ValueError('This checkpoint has no temporal position embeddings. Retrain with the 2D+t architecture.')
-    cfg = dict(base=16, dim=128, heads=4, token_grid=(2,4,4), intra_layers=1, inter_layers=2, temporal_size=64)
-    cfg.update(checkpoint.get('model_config', {}))
-    if not checkpoint.get('model_config'):
-        cfg['temporal_size'] = state['encoders.2ch.temporal_pos'].shape[-1]
-        if first_weight is not None:
-            cfg['base'] = first_weight.shape[0]
-        if 'inter.fusion_grid' in state:
-            cfg['dim'] = state['inter.fusion_grid'].shape[1]
-            cfg['token_grid'] = tuple(state['inter.fusion_grid'].shape[2:])
-        cfg['intra_layers'] = len({int(k.split('.')[3]) for k in state
-                                   if k.startswith('encoders.2ch.intra.')})
-        cfg['inter_layers'] = len({int(k.split('.')[2]) for k in state if k.startswith('inter.layers.')})
+    if checkpoint.get('architecture') != 'center_window_lax_3d_sax_v1':
+        raise ValueError('Checkpoint is not a center-window model. Regenerate preprocessing and retrain; old 64-channel/2D+t heads are incompatible.')
+    cfg = dict(checkpoint['model_config'])
+    if any(sizes[v][0] != cfg['temporal_size'] for v in VIEWS[:2]):
+        raise ValueError('Window size differs between checkpoint and requested preprocessing')
     for name in cfg:
         override = getattr(args, name, None)
         if override is not None:
@@ -202,7 +191,7 @@ def main():
         raise ValueError(f'No cases in YAML split {args.split!r}')
     dataset = MultiSourceNiftiDataset3D(cases=cases, output_sizes=sizes,
                                          source_num_classes=classes, augment=False,
-                                         load_anno=args.split != 'test')
+                                         load_anno=args.split != 'test', complete_cine=True)
     model = make_model(cfg, order, classes, device)
     try:
         model.load_state_dict(state, strict=True)
@@ -294,7 +283,8 @@ def main():
         'split': args.split, 'evaluation_mode': args.eval_mode,
         'random_seed': args.seed, 'random_repeats': args.random_repeats,
         'output_sizes':{v:list(s) for v,s in sizes.items()},
-        'lax_metrics':'mean over 2D frames', 'network_input':'full 2D+t cine + 3D SAX',
+        'lax_metrics':'mean over 2D frames', 'network_input':'centered LAX windows + shared 3D SAX',
+        'sax_aggregation':'mean window probabilities', 'pairing':'nearest normalized sequence position',
         'results':report
     }, indent=2, ensure_ascii=False), encoding='utf-8')
     print('Saved outputs to:', outdir)
