@@ -1,2 +1,6 @@
 __pycache__/
 /rawdata/CINE_MULTI
+/preprocess/processed/
+/preprocess/matched.yaml
+/checkpoints/
+/results/

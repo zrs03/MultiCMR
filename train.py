@@ -2,26 +2,82 @@ import argparse
 import json
 import os
 import time
-from collections import defaultdict
 from typing import Dict, Tuple
 
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-from models import *
+from models import MMFormerAnatomy
+from preprocess.processing import validate_output_sizes
 from utils import (
     MultiSourceNiftiDataset3D,
     dice_ce_loss_per_sample,
-    dice_ce_loss,
     load_cases_from_yaml,
     multiclass_dice_iou,
     set_seed,
 )
 
+
+def boundary_loss_per_sample(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    downsample: int = 2,
+    max_distance: float = 10.0,
+    framewise: bool = False,
+) -> torch.Tensor:
+    """Signed-distance boundary loss (foreground classes only), shape [B].
+    A true GT signed distance field is computed without gradient using SciPy.
+    Output probabilities remain differentiable. Inside distances are negative.
+    Empty foreground classes are skipped; foreground classes are averaged.
+    downsample=2 computes distance maps on a half-resolution grid for speed.
+    For very thin structures, use --boundary-downsample 1.
+    """
+    if framewise:
+        batch, classes, time, height, width = logits.shape
+        frames = logits.permute(0, 2, 1, 3, 4).reshape(batch * time, classes, height, width)
+        values = boundary_loss_per_sample(frames, target.reshape(batch * time, height, width),
+                                          num_classes, downsample, max_distance)
+        return values.reshape(batch, time).mean(1)
+    if logits.ndim not in (4, 5) or target.ndim != logits.ndim - 1:
+        raise ValueError("Expected 2D/3D logits [B,C,...] and target [B,...]")
+    if logits.shape[0] != target.shape[0] or logits.shape[1] != num_classes:
+        raise ValueError("Logits/target/num_classes mismatch")
+    if downsample < 1 or max_distance <= 0:
+        raise ValueError("downsample must be >=1; max_distance must be positive")
+    if downsample > 1:
+        size = tuple(max(1, (d + downsample - 1) // downsample) for d in target.shape[1:])
+        # Resize probability maps and labels to the SAME coarse grid.
+        probs = F.interpolate(torch.softmax(logits.float(), dim=1), size=size,
+                              mode="bilinear" if logits.ndim == 4 else "trilinear", align_corners=False)
+        gt = F.interpolate(target[:, None].float(), size=size,
+                           mode="nearest")[:, 0].long()
+    else:
+        probs = torch.softmax(logits.float(), dim=1)
+        gt = target.long()
+    gt_np = gt.detach().cpu().numpy()
+    losses = []
+    for b in range(gt.shape[0]):
+        per_class = []
+        for c in range(1, num_classes):  # ignore background
+            mask = (gt_np[b] == c)
+            if not mask.any() or mask.all():
+                continue
+            inside = distance_transform_edt(mask)
+            outside = distance_transform_edt(~mask)
+            signed = np.clip(outside - inside, -max_distance, max_distance)
+            signed = np.asarray(signed / max_distance, dtype=np.float32)
+            signed_tensor = torch.from_numpy(signed).to(device=probs.device)
+            per_class.append((probs[b, c] * signed_tensor).mean())
+        # Return a graph-connected zero for samples without foreground.
+        losses.append(torch.stack(per_class).mean() if per_class
+                      else probs[b].sum() * 0.0)
+    return torch.stack(losses)
 
 def init_distributed() -> Tuple[bool, int, int, int]:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -102,254 +158,70 @@ def get_model_core(model: torch.nn.Module):
 
 
 def run_one_epoch(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    source_order: list,
-    num_classes_by_source: Dict[str, int],
-    is_train: bool,
-    missing_modality_temperature: float = 1.0,
-    token_loss_weight: float = 0.5,
-    is_distributed: bool = False,
-    world_size: int = 1,
+    model, loader, optimizer, device, source_order, num_classes_by_source,
+    is_train, boundary_weight=.05, boundary_downsample=2, boundary_max_distance=10.,
+    aux_weight=.2, deep_weight=.1, is_distributed=False, world_size=1,
 ):
-    if is_train:
-        model.train()
-    else:
-        model.eval()
-
-    epoch_loss = 0.0
-
-    source_stats = defaultdict(
-        lambda: {
-            "dice": [],
-            "iou": [],
-        }
-    )
-
+    model.train(is_train)
+    epoch_loss, steps = 0., 0
+    # Sums and counts exclude absent views from both loss and metrics.
+    stats = {v: torch.zeros(3, device=device) for v in source_order}
     for batch in loader:
-
-        # ========================================================
-        # 1. Input
-        # ========================================================
-
-        images = batch["image"].to(
-            device,
-            non_blocking=True,
-        )
-
-        if batch["masks"] is None:
-            raise RuntimeError(
-                "Training/validation requires annotations, "
-                "but dataset returned masks=None."
-            )
-
-        masks = {
-            source: batch["masks"][source].to(
-                device,
-                non_blocking=True,
-            )
-            for source in source_order
-        }
-
-        batch_size = images.shape[0]
-
-        # ========================================================
-        # 2. Modality mask
-        # ========================================================
-
+        images = {v: batch['image'][v].to(device, non_blocking=True) for v in source_order}
+        if not batch['masks']:
+            raise RuntimeError('Training/validation requires annotations')
+        targets = {v: batch['masks'][v].to(device, non_blocking=True) for v in source_order}
+        batch_size = images['sa'].shape[0]
+        modality_mask = (sample_modality_mask(batch_size, len(source_order), device)
+                         if is_train else torch.ones(batch_size, len(source_order), device=device))
+        # The model selects present samples before encoding, for both 2D and 3D inputs.
         if is_train:
-            modality_mask = sample_modality_mask(
-                batch_size=batch_size,
-                num_modalities=len(source_order),
-                device=device,
-            )
-        else:
-            modality_mask = torch.ones(
-                batch_size,
-                len(source_order),
-                dtype=torch.float32,
-                device=device,
-            )
-
-        # ========================================================
-        # 3. Mask input modalities
-        # ========================================================
-
-        masked_images = (
-            images
-            * modality_mask[:, :, None, None, None]
-        )
-
-        # ========================================================
-        # 4. Zero gradient
-        # ========================================================
-
-        if is_train:
-            optimizer.zero_grad()
-
-        # ========================================================
-        # 5. Forward
-        # ========================================================
-
+            optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(is_train):
-
-            # 传入完整 images 用于获取缺失模态应有的真实 Token (full_x)
-            outputs = model(
-                masked_images,
-                modality_mask,
-                full_x=images if is_train else None,
-            )
-
-            total_seg_loss = 0.0
-            total_loss_weight = 0.0  # 用于有效权重归一化
-
-            # ====================================================
-            # 6. Calculate segmentation loss for each source
-            # ====================================================
-
-            logits_dict = outputs["logits"]
-            
-            for src_index, src_name in enumerate(source_order):
-
-                logits = logits_dict[src_name]
-                target = masks[src_name]
-                num_classes = num_classes_by_source[src_name]
-
-                # 空间对齐
-                if logits.shape[2:] != target.shape[1:]:
-                    logits = F.interpolate(
-                        logits,
-                        size=target.shape[1:],
-                        mode="trilinear",
-                        align_corners=False,
-                    )
-
-                # Per-sample Dice + CE
-                loss_per_sample = dice_ce_loss_per_sample(
-                    logits=logits,
-                    target=target,
-                    num_classes=num_classes,
-                )
-
-                # Temperature weighting
-                present = modality_mask[:, src_index]
-                loss_weight = (
-                    present
-                    + (1.0 - present) * missing_modality_temperature
-                )
-
-                source_loss = (loss_per_sample * loss_weight).mean()
-                total_seg_loss = total_seg_loss + source_loss
-                
-                # 累加有效权重
-                total_loss_weight = total_loss_weight + loss_weight.mean()
-
-                # Metrics
-                dice, iou = multiclass_dice_iou(
-                    logits,
-                    target,
-                    num_classes,
-                )
-
-                source_stats[src_name]["dice"].append(
-                    float(dice.detach().cpu().item())
-                )
-
-                source_stats[src_name]["iou"].append(
-                    float(iou.detach().cpu().item())
-                )
-
-            # 采用有效权重归一化，替代原来的 / len(source_order)
-            batch_loss = total_seg_loss / (total_loss_weight + 1e-8)
-
-            # ====================================================
-            # 7. 计算缺失模态 Token 重建 Loss
-            # ====================================================
-            total_token_loss = torch.tensor(0.0, device=device)
-            if is_train and "gt_tokens" in outputs and outputs["gt_tokens"]:
-                pred_tokens_dict = outputs["pred_tokens"]
-                gt_tokens_dict = outputs["gt_tokens"]
-
-                missing_count = 0
-                for src_index, src_name in enumerate(source_order):
-                    missing_mask = (modality_mask[:, src_index] == 0)  # [B]
-                    if missing_mask.any():
-                        pred_t = pred_tokens_dict[src_name][missing_mask]  # [M, P, C]
-                        gt_t = gt_tokens_dict[src_name][missing_mask]      # [M, P, C]
-                        
-                        # MSE 重建损失
-                        recon_loss = F.mse_loss(pred_t, gt_t)
-                        total_token_loss = total_token_loss + recon_loss
-                        missing_count += 1
-
-                if missing_count > 0:
-                    total_token_loss = total_token_loss / missing_count
-                    batch_loss = batch_loss + token_loss_weight * total_token_loss
-
-            # ====================================================
-            # 8. Backward
-            # ====================================================
-
+            outputs = model(images, modality_mask)
+            loss_sum, count = 0., 0
+            for i, view in enumerate(source_order):
+                valid = modality_mask[:, i].bool()
+                n = int(valid.sum())
+                if not n:
+                    continue
+                logits = outputs['logits'][view][valid]
+                target = targets[view][valid]
+                classes = num_classes_by_source[view]
+                loss = dice_ce_loss_per_sample(logits, target, classes, framewise=view != 'sa')
+                if boundary_weight > 0:
+                    loss = loss + boundary_weight * boundary_loss_per_sample(
+                        logits, target, classes, boundary_downsample, boundary_max_distance, framewise=view != 'sa')
+                if is_train and aux_weight > 0:
+                    loss = loss + aux_weight * dice_ce_loss_per_sample(
+                        outputs['aux_logits'][view][valid], target, classes, framewise=view != 'sa')
+                if is_train and deep_weight > 0:
+                    for pred in outputs['deep_logits'][view]:
+                        loss = loss + deep_weight * dice_ce_loss_per_sample(pred[valid], target, classes, framewise=view != 'sa')
+                loss_sum = loss_sum + loss.sum()
+                count += n
+                with torch.no_grad():
+                    dice, iou = multiclass_dice_iou(logits, target, classes, framewise=view != 'sa')
+                    stats[view] += torch.stack((dice * n, iou * n, logits.new_tensor(n)))
+            batch_loss = loss_sum / count
             if is_train:
                 batch_loss.backward()
                 optimizer.step()
-
-        # ========================================================
-        # 9. Distributed loss
-        # ========================================================
-
-        loss_val = batch_loss.detach()
-
-        if is_distributed:
-            loss_val = reduce_tensor(
-                loss_val,
-                world_size,
-            )
-
-        epoch_loss += float(loss_val.cpu().item())
-
-    # ============================================================
-    # 10. Epoch average loss
-    # ============================================================
-
-    num_steps = max(len(loader), 1)
-    epoch_loss /= num_steps
-
-    # ============================================================
-    # 11. Summarize metrics
-    # ============================================================
-
-    summarized = {}
-
-    for src in source_order:
-        dice_values = source_stats[src]["dice"]
-        iou_values = source_stats[src]["iou"]
-
-        mean_dice = float(np.mean(dice_values)) if dice_values else 0.0
-        mean_iou = float(np.mean(iou_values)) if iou_values else 0.0
-
-        if is_distributed:
-            d_tensor = torch.tensor(mean_dice, device=device)
-            i_tensor = torch.tensor(mean_iou, device=device)
-
-            d_tensor = reduce_tensor(d_tensor, world_size)
-            i_tensor = reduce_tensor(i_tensor, world_size)
-
-            mean_dice = float(d_tensor.cpu().item())
-            mean_iou = float(i_tensor.cpu().item())
-
-        summarized[src] = {
-            "dice": mean_dice,
-            "iou": mean_iou,
-        }
-
-    return epoch_loss, summarized
+        epoch_loss += float(batch_loss.detach())
+        steps += 1
+    totals = torch.tensor([epoch_loss, steps], device=device, dtype=torch.float64)
+    if is_distributed:
+        dist.all_reduce(totals)
+        for values in stats.values():
+            dist.all_reduce(values)
+    summarized = {v: {'dice': float(values[0] / values[2].clamp_min(1)),
+                      'iou': float(values[1] / values[2].clamp_min(1))}
+                  for v, values in stats.items()}
+    return float(totals[0] / totals[1].clamp_min(1)), summarized
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train 3D ResUNet++ multi-head on multi-sequence CMR NIfTI")
+    parser = argparse.ArgumentParser(description="Train full-cine 2D+t LAX + 3D SAX with masked token fusion")
     parser.add_argument("--split-yaml", type=str, default="preprocess/matched.yaml", help="Path to preprocessed split YAML")
     parser.add_argument("--output-dir", type=str, default="checkpoints", help="Directory to save checkpoints and logs")
     parser.add_argument("--source-order", nargs="+", default=None, help="List of sequence sources (defaults to YAML or [2ch 4ch sa])")
@@ -359,8 +231,17 @@ def main():
         default=None,
         help="JSON string specifying number of classes per source (defaults to YAML)",
     )
-    parser.add_argument("--input-size", nargs=3, type=int, default=[64, 160, 160], help="Target volume size (D, H, W)")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per GPU")
+    parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH T H W (default 64 128 128 or YAML)')
+    parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX D H W (default 128 128 128 or YAML)')
+    parser.add_argument('--base', type=int, default=16)
+    parser.add_argument('--dim', type=int, default=128)
+    parser.add_argument('--heads', type=int, default=4)
+    parser.add_argument('--token-grid', nargs=3, type=int, default=(2, 4, 4))
+    parser.add_argument('--intra-layers', type=int, default=1)
+    parser.add_argument('--inter-layers', type=int, default=2)
+    parser.add_argument('--aux-weight', type=float, default=.2)
+    parser.add_argument('--deep-weight', type=float, default=.1)
+    parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--epochs", type=int, default=200, help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -372,20 +253,16 @@ def main():
         help="Device for single GPU training (e.g. cuda, cuda:0, cpu)",
     )
     parser.add_argument(
-        "--missing-modality-temperature",
-        type=float,
-        default=0.0,
-        help=(
-            "Loss weight for a target modality whose input modality "
-            "is missing during training. "
-            "1.0 means no extra weighting."
-        ),
+        "--boundary-weight", type=float, default=0.05,
+        help="Weight of signed-distance boundary loss (0 disables it).",
     )
     parser.add_argument(
-        "--token-loss-weight",
-        type=float,
-        default=0.0,
-        help="Loss weight for reconstructing tokens of missing modalities from present modalities/anatomy.",
+        "--boundary-downsample", type=int, default=2,
+        help="Compute distance loss at 1/N spatial scale (1=full resolution).",
+    )
+    parser.add_argument(
+        "--boundary-max-distance", type=float, default=10.0,
+        help="Clip signed distance to +/- this many voxels at loss scale.",
     )
     args = parser.parse_args()
 
@@ -443,15 +320,28 @@ def main():
         print(f"[MultiCMR] Source Order: {source_order}")
         print(f"[MultiCMR] Num Classes: {num_classes_by_source}")
 
+    output_sizes = validate_output_sizes(info.get('output_sizes'))
+    if args.lax_size:
+        output_sizes.update({'2ch': args.lax_size, '4ch': args.lax_size})
+    if args.sax_size:
+        output_sizes['sa'] = args.sax_size
+    output_sizes = validate_output_sizes(output_sizes)
+    model_config = dict(base=args.base, dim=args.dim, heads=args.heads,
+                        token_grid=args.token_grid, intra_layers=args.intra_layers,
+                        inter_layers=args.inter_layers,
+                        temporal_size=max(output_sizes[v][0] for v in ('2ch', '4ch')))
+    if is_master_proc(rank):
+        print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=full 2D+t cine')
+
     train_dataset = MultiSourceNiftiDataset3D(
         cases=train_cases,
-        output_size=args.input_size,
+        output_sizes=output_sizes,
         source_num_classes=num_classes_by_source,
         augment=True,
     )
     val_dataset = MultiSourceNiftiDataset3D(
         cases=val_cases,
-        output_size=args.input_size,
+        output_sizes=output_sizes,
         source_num_classes=num_classes_by_source,
         augment=False,
     )
@@ -484,6 +374,7 @@ def main():
         in_channels=1,
         source_order=source_order,
         num_classes_by_source=num_classes_by_source,
+        **model_config,
     ).to(device)
 
     if is_distributed:
@@ -503,7 +394,7 @@ def main():
 
     if is_master_proc(rank):
         with open(log_path, "w", encoding="utf-8") as file:
-            file.write(f"3D Multi-Head CMR Training Log (World size: {world_size})\n")
+            file.write(f"2D+t LAX + 3D SAX Training Log (World size: {world_size})\n")
 
     for epoch in range(1, args.epochs + 1):
         if is_distributed and train_sampler is not None:
@@ -519,8 +410,11 @@ def main():
             source_order=source_order,
             num_classes_by_source=num_classes_by_source,
             is_train=True,
-            missing_modality_temperature=args.missing_modality_temperature,
-            token_loss_weight=args.token_loss_weight,
+            aux_weight=args.aux_weight,
+            deep_weight=args.deep_weight,
+            boundary_weight=args.boundary_weight,
+            boundary_downsample=args.boundary_downsample,
+            boundary_max_distance=args.boundary_max_distance,
             is_distributed=is_distributed,
             world_size=world_size,
         )
@@ -533,6 +427,9 @@ def main():
             source_order=source_order,
             num_classes_by_source=num_classes_by_source,
             is_train=False,
+            boundary_weight=args.boundary_weight,
+            boundary_downsample=args.boundary_downsample,
+            boundary_max_distance=args.boundary_max_distance,
             is_distributed=is_distributed,
             world_size=world_size,
         )
@@ -551,7 +448,9 @@ def main():
                         "model": raw_model.state_dict(),
                         "source_order": source_order,
                         "num_classes_by_source": num_classes_by_source,
-                        "input_size": args.input_size,
+                        "output_sizes": output_sizes,
+                        "model_config": model_config,
+                        "architecture": "temporal_2d_lax_3d_sax_v1",
                     },
                     best_ckpt,
                 )

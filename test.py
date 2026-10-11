@@ -4,27 +4,23 @@ Compatible with train.py's load_cases_from_yaml / MultiSourceNiftiDataset3D
 and MMFormerAnatomy(x, modality_mask) interface.
 
 Example:
-  python test_mmformer_yaml.py --split-yaml preprocess/matched.yaml \
+  python test.py --split-yaml preprocess/matched.yaml \
     --checkpoint checkpoints/best_model_3d_multihead.pth --split test
 
-NIfTI outputs default to MODEL/RESIZED space with identity affine. To export
-in original physical coordinates, dataset items must supply per-view original
-shape AND affine (and correct spatial orientation); otherwise physical space
-cannot be recovered reliably by merely resizing a tensor.
+LAX enters the network as a complete cine with framewise 2D encoding and
+temporal patch concatenation. Exports use model space: LAX [H,W,1,T] and SAX [H,W,D].
 """
 from __future__ import annotations
 import argparse
 import json
 import csv
 import random
-import os
 import re
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 try:
     import nibabel as nib
@@ -36,6 +32,8 @@ except ImportError as exc:
     raise ImportError('Install opencv-python: pip install opencv-python') from exc
 
 from models import MMFormerAnatomy
+from preprocess.processing import validate_output_sizes
+from utils.inference import predict_cine
 from utils import MultiSourceNiftiDataset3D, load_cases_from_yaml, multiclass_dice_iou_hd95
 
 VIEWS = ('2ch', '4ch', 'sa')
@@ -87,15 +85,23 @@ def visualize(img, gt, pred, target):
     cv2.imwrite(str(target), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
 
 
-def normalize_item_image(image, nviews):
-    """Dataset returns [3,D,H,W] or [3,1,D,H,W]; add batch dimension."""
-    if not isinstance(image, torch.Tensor):
-        image = torch.as_tensor(image)
-    if image.ndim == 5 and image.shape[0] == nviews and image.shape[1] == 1:
-        image = image[:,0]
-    if image.ndim != 4 or image.shape[0] != nviews:
-        raise ValueError(f'Expected item["image"] [3,D,H,W], got {tuple(image.shape)}')
-    return image.unsqueeze(0).float()
+def normalize_item_image(images, source_order):
+    """Dataset cines/volumes [1,T/D,H,W]; add a batch dimension per view."""
+    result = {}
+    for view in source_order:
+        image = torch.as_tensor(images[view])
+        if image.ndim != 4 or image.shape[0] != 1:
+            raise ValueError(f'{view}: expected [1,T/D,H,W], got {tuple(image.shape)}')
+        result[view] = image.unsqueeze(0).float()
+    return result
+
+
+def evaluate_prediction(pred, target, view, classes):
+    if view == 'sa':
+        return multiclass_dice_iou_hd95(pred, target, classes)[:3]
+    # Distances are spatial and must not use time as a third spatial axis.
+    values = [multiclass_dice_iou_hd95(p, y, classes)[:3] for p, y in zip(pred, target)]
+    return tuple(np.asarray(values).mean(axis=0))
 
 
 def extract_mask(item, view, i, source_order):
@@ -117,7 +123,8 @@ def make_model(config, order, classes, device):
                            base=config['base'], dim=config['dim'],
                            heads=config['heads'], token_grid=tuple(config['token_grid']),
                            intra_layers=config['intra_layers'],
-                           inter_layers=config['inter_layers']).to(device)
+                           inter_layers=config['inter_layers'],
+                           temporal_size=config['temporal_size']).to(device)
 
 
 def main():
@@ -126,16 +133,16 @@ def main():
     pa.add_argument('--split', choices=['train','val','test'], default='val')
     pa.add_argument('--checkpoint', required=True)
     pa.add_argument('--output-dir', default='results_mmformer')
-    pa.add_argument('--input-size', type=int, nargs=3, default=None,
-                    help='Override checkpoint input size (default checkpoint or 64 160 160)')
+    pa.add_argument('--lax-size', type=int, nargs=3, default=None, help='2CH/4CH T H W')
+    pa.add_argument('--sax-size', type=int, nargs=3, default=None, help='SAX D H W')
     pa.add_argument('--source-order', nargs='+', default=None)
     pa.add_argument('--num-classes-json', default=None)
-    pa.add_argument('--base', type=int, default=32)
-    pa.add_argument('--dim', type=int, default=128)
-    pa.add_argument('--heads', type=int, default=4)
-    pa.add_argument('--token-grid', type=int, nargs=3, default=(2,4,4))
-    pa.add_argument('--intra-layers', type=int, default=1)
-    pa.add_argument('--inter-layers', type=int, default=2)
+    pa.add_argument('--base', type=int, default=None)
+    pa.add_argument('--dim', type=int, default=None)
+    pa.add_argument('--heads', type=int, default=None)
+    pa.add_argument('--token-grid', type=int, nargs=3, default=None)
+    pa.add_argument('--intra-layers', type=int, default=None)
+    pa.add_argument('--inter-layers', type=int, default=None)
     pa.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     pa.add_argument('--vis-per-source', type=int, default=3)
     pa.add_argument('--no-save-nifti', action='store_true')
@@ -162,28 +169,40 @@ def main():
     classes = (json.loads(args.num_classes_json) if args.num_classes_json else
                checkpoint.get('num_classes_by_source') or info['num_classes_by_source'])
     classes = {k:int(v) for k,v in classes.items()}
-    size = tuple(args.input_size or checkpoint.get('input_size') or (64,160,160))
-    cfg = dict(base=args.base, dim=args.dim, heads=args.heads,
-               token_grid=args.token_grid, intra_layers=args.intra_layers,
-               inter_layers=args.inter_layers)
-    # Recover architecture parameters where possible, while preserving explicit CLI choices.
-    if 'encoders.2ch.c1.conv.0.weight' in state and args.base == 32:
-        cfg['base'] = state['encoders.2ch.c1.conv.0.weight'].shape[0]
-    if 'encoders.2ch.token_pos' in state and args.dim == 128:
-        cfg['dim'] = state['encoders.2ch.token_pos'].shape[1]
-        cfg['token_grid'] = tuple(state['encoders.2ch.token_pos'].shape[2:])
-    if 'inter.fusion_grid' in state and args.token_grid == (2,4,4):
-        cfg['token_grid'] = tuple(state['inter.fusion_grid'].shape[2:])
-    if args.intra_layers == 1:
-        cfg['intra_layers'] = len(set(int(k.split('.')[3]) for k in state if k.startswith('encoders.2ch.intra.') and k.split('.')[3].isdigit())) or 1
-    if args.inter_layers == 2:
-        cfg['inter_layers'] = len(set(int(k.split('.')[2]) for k in state if k.startswith('inter.layers.') and k.split('.')[2].isdigit())) or 2
-    print('Split:', args.split, 'Cases:', len(cases), 'Classes:', classes, 'Input size:', size)
+    sizes = validate_output_sizes(checkpoint.get('output_sizes') or info.get('output_sizes'))
+    if args.lax_size:
+        sizes.update({'2ch': args.lax_size, '4ch': args.lax_size})
+    if args.sax_size:
+        sizes['sa'] = args.sax_size
+    sizes = validate_output_sizes(sizes)
+    first_weight = state.get('encoders.2ch.c1.conv.0.weight')
+    if first_weight is not None and first_weight.ndim != 4:
+        raise ValueError('This checkpoint uses a 3D LAX encoder. Retrain with the 2D+t architecture.')
+    if 'encoders.2ch.temporal_pos' not in state:
+        raise ValueError('This checkpoint has no temporal position embeddings. Retrain with the 2D+t architecture.')
+    cfg = dict(base=16, dim=128, heads=4, token_grid=(2,4,4), intra_layers=1, inter_layers=2, temporal_size=64)
+    cfg.update(checkpoint.get('model_config', {}))
+    if not checkpoint.get('model_config'):
+        cfg['temporal_size'] = state['encoders.2ch.temporal_pos'].shape[-1]
+        if first_weight is not None:
+            cfg['base'] = first_weight.shape[0]
+        if 'inter.fusion_grid' in state:
+            cfg['dim'] = state['inter.fusion_grid'].shape[1]
+            cfg['token_grid'] = tuple(state['inter.fusion_grid'].shape[2:])
+        cfg['intra_layers'] = len({int(k.split('.')[3]) for k in state
+                                   if k.startswith('encoders.2ch.intra.')})
+        cfg['inter_layers'] = len({int(k.split('.')[2]) for k in state if k.startswith('inter.layers.')})
+    for name in cfg:
+        override = getattr(args, name, None)
+        if override is not None:
+            cfg[name] = override
+    print('Split:', args.split, 'Cases:', len(cases), 'Classes:', classes, 'Per-view sizes:', sizes)
     print('Model hyperparameters:', cfg)
     if not cases:
         raise ValueError(f'No cases in YAML split {args.split!r}')
-    dataset = MultiSourceNiftiDataset3D(cases=cases, output_size=size,
-                                         source_num_classes=classes, augment=False)
+    dataset = MultiSourceNiftiDataset3D(cases=cases, output_sizes=sizes,
+                                         source_num_classes=classes, augment=False,
+                                         load_anno=args.split != 'test')
     model = make_model(cfg, order, classes, device)
     try:
         model.load_state_dict(state, strict=True)
@@ -201,12 +220,12 @@ def main():
     print('Evaluation mode:', args.eval_mode, '| random seed:', args.seed)
     print('NOTE: Missing-view predictions are not supported by this architecture; '
           'only present-view segmentations are evaluated in each scenario.')
-    print('NIfTI exports are in resized/model voxel coordinates with identity affine; '
-          'original physical coordinates cannot be recovered without trustworthy geometry metadata.')
+    print('Model-space exports: LAX [H,W,1,T], SAX [H,W,D]; LAX metrics are framewise.')
     with torch.inference_mode():
         for idx in range(len(dataset)):
             item = dataset[idx]
-            images = normalize_item_image(item['image'], len(order)).to(device)
+            images = {v: image.to(device) for v, image in
+                      normalize_item_image(item['image'], order).items()}
             identifier = safe_name(item.get('case_id', item.get('id', f'case_{idx:04d}')))
             scenarios = []
             if args.eval_mode in ('full', 'both'):
@@ -218,22 +237,18 @@ def main():
                 scenarios.extend((f'mask_{"".join(map(str, m))}', m) for m in all_masks)
             for scenario, mask_values in scenarios:
                 present = torch.tensor(mask_values, dtype=torch.bool, device=device).unsqueeze(0)
-                masked_images = images * present[:, :, None, None, None].to(images.dtype)
-                # Match the forward call and explicit input masking used in train.py.
-                outputs = model(masked_images, present.float())
+                predictions = predict_cine(model, images, present)
                 for vi, view in enumerate(order):
                     if not mask_values[vi]:
                         continue  # Never score absent-view zero placeholders.
-                    logits = outputs['logits'][view]
-                    pred = logits.argmax(dim=1)[0].cpu()
+                    pred = predictions[view][0]
                     gt = extract_mask(item, view, vi, order)
                     scores = {'dice': None, 'iou': None, 'hd95': None}
                     if gt is not None:
-                        gt = torch.as_tensor(gt).squeeze().long().cpu()
+                        gt = torch.as_tensor(gt).long().cpu()
                         if tuple(gt.shape) != tuple(pred.shape):
-                            gt = F.interpolate(gt[None, None].float(), size=pred.shape,
-                                               mode='nearest')[0, 0].long()
-                        values = multiclass_dice_iou_hd95(pred, gt, classes[view])
+                            raise ValueError(f'{view}: prediction and target shapes disagree')
+                        values = evaluate_prediction(pred, gt, view, classes[view])
                         for name, value in zip(('dice','iou','hd95'), values[:3]):
                             score = metric_scalar(value)
                             if np.isfinite(score):
@@ -246,11 +261,14 @@ def main():
                     if not args.no_save_nifti:
                         folder = outdir / scenario
                         folder.mkdir(parents=True, exist_ok=True)
-                        nib.save(nib.Nifti1Image(pred.numpy().astype(np.uint8), np.eye(4)),
+                        array = np.moveaxis(pred.numpy().astype(np.uint8), 0, -1)
+                        if view != 'sa':
+                            array = array[:, :, None, :]  # NIfTI time is dimension four.
+                        nib.save(nib.Nifti1Image(array, np.eye(4)),
                                  str(folder / f'{stem}_model_space.nii.gz'))
                     vis_key = (scenario, view)
                     if gt is not None and vis_count[vis_key] < args.vis_per_source:
-                        visualize(images[0,vi].cpu().numpy(), gt.numpy(), pred.numpy(),
+                        visualize(images[view][0,0].cpu().numpy(), gt.numpy(), pred.numpy(),
                                   outdir / 'visualization' / scenario / view / f'{stem}.png')
                         vis_count[vis_key] += 1
             if (idx+1) % 10 == 0 or idx+1 == len(dataset):
@@ -275,7 +293,9 @@ def main():
     (outdir/'metrics.json').write_text(json.dumps({
         'split': args.split, 'evaluation_mode': args.eval_mode,
         'random_seed': args.seed, 'random_repeats': args.random_repeats,
-        'input_size':list(size), 'results':report
+        'output_sizes':{v:list(s) for v,s in sizes.items()},
+        'lax_metrics':'mean over 2D frames', 'network_input':'full 2D+t cine + 3D SAX',
+        'results':report
     }, indent=2, ensure_ascii=False), encoding='utf-8')
     print('Saved outputs to:', outdir)
 
