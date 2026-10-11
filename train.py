@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from models import MMFormerAnatomy
+from utils.checkpoint import ARCHITECTURE, atomic_save, capture_rng_state, restore_training_state
 from preprocess.processing import validate_output_sizes
 from utils import (
     MultiSourceNiftiDataset3D,
@@ -243,6 +244,7 @@ def main():
     parser.add_argument('--deep-weight', type=float, default=.1)
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
+    parser.add_argument("--resume", default=None, help="Checkpoint path to resume; --epochs is the total target epoch")
     parser.add_argument("--epochs", type=int, default=200, help="Total training epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
@@ -265,6 +267,8 @@ def main():
         help="Clip signed distance to +/- this many voxels at loss scale.",
     )
     args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("--epochs must be positive")
 
     is_distributed, rank, local_rank, world_size = init_distributed()
     set_seed(args.seed + rank)
@@ -330,6 +334,21 @@ def main():
                         token_grid=args.token_grid, intra_layers=args.intra_layers,
                         inter_layers=args.inter_layers,
                         temporal_size=max(output_sizes[v][0] for v in ('2ch', '4ch')))
+    resume_checkpoint = None
+    if args.resume:
+        resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        if resume_checkpoint.get('architecture') != ARCHITECTURE:
+            raise ValueError('Resume requires a FiLM center-window checkpoint; cross-attention and older architectures are incompatible')
+        if list(resume_checkpoint['source_order']) != list(source_order):
+            raise ValueError('Resume checkpoint source order differs from current data')
+        if resume_checkpoint['num_classes_by_source'] != num_classes_by_source:
+            raise ValueError('Resume checkpoint class counts differ from current data')
+        if validate_output_sizes(resume_checkpoint['output_sizes']) != output_sizes:
+            raise ValueError('Resume checkpoint window/spatial sizes differ from current preprocessing')
+        # The checkpoint owns architecture settings; no need to repeat --base, --dim, etc.
+        model_config = dict(resume_checkpoint['model_config'])
+        if model_config['temporal_size'] != output_sizes['2ch'][0]:
+            raise ValueError('Resume checkpoint temporal_size is inconsistent with preprocessing')
     if is_master_proc(rank):
         print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=center-window + shared SAX')
 
@@ -388,15 +407,27 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
 
-    best_val_dice = -1.0
+    start_epoch, best_val_dice = 1, -1.0
+    if resume_checkpoint is not None:
+        start_epoch, best_val_dice = restore_training_state(
+            resume_checkpoint, get_model_core(model), optimizer, scheduler, rank, world_size)
+        del resume_checkpoint
+    last_ckpt = os.path.join(args.output_dir, "last_model_3d_multihead.pth")
     best_ckpt = os.path.join(args.output_dir, "best_model_3d_multihead.pth")
     log_path = os.path.join(args.output_dir, "train_log.txt")
 
     if is_master_proc(rank):
-        with open(log_path, "w", encoding="utf-8") as file:
+        with open(log_path, "a" if args.resume else "w", encoding="utf-8") as file:
             file.write(f"Center-window LAX + 3D SAX Training Log (World size: {world_size})\n")
+            if args.resume:
+                message = (f"Resume: {args.resume} | next_epoch={start_epoch} | "
+                           f"best_val_dice={best_val_dice:.6f} | lr={optimizer.param_groups[0]['lr']:.8g}")
+                print(message)
+                file.write(message + "\n")
+        if start_epoch > args.epochs:
+            print(f'Checkpoint already reached target epoch {args.epochs}; no training steps needed.')
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -439,21 +470,33 @@ def main():
         val_dice_values = [val_stats[src]["dice"] for src in source_order]
         mean_val_dice = float(np.mean(val_dice_values)) if val_dice_values else 0.0
 
+        improved = mean_val_dice > best_val_dice
+        best_val_dice = max(best_val_dice, mean_val_dice)
+        local_rng = capture_rng_state()
+        if is_distributed:
+            rng_states = [None] * world_size
+            dist.all_gather_object(rng_states, local_rng)
+        else:
+            rng_states = [local_rng]
         if is_master_proc(rank):
-            if mean_val_dice > best_val_dice:
-                best_val_dice = mean_val_dice
-                raw_model = get_model_core(model)
-                torch.save(
-                    {
-                        "model": raw_model.state_dict(),
-                        "source_order": source_order,
-                        "num_classes_by_source": num_classes_by_source,
-                        "output_sizes": output_sizes,
-                        "model_config": model_config,
-                        "architecture": "center_window_lax_3d_sax_v1",
-                    },
-                    best_ckpt,
-                )
+            checkpoint = {
+                "model": get_model_core(model).state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch,
+                "best_val_dice": best_val_dice,
+                "rng_states": rng_states,
+                "world_size": world_size,
+                "train_args": vars(args),
+                "source_order": source_order,
+                "num_classes_by_source": num_classes_by_source,
+                "output_sizes": output_sizes,
+                "model_config": model_config,
+                "architecture": ARCHITECTURE,
+            }
+            atomic_save(checkpoint, last_ckpt)
+            if improved:
+                atomic_save(checkpoint, best_ckpt)
 
             elapsed = time.time() - epoch_start
             line = (
@@ -471,7 +514,7 @@ def main():
                 file.write(line)
 
     if is_master_proc(rank):
-        print(f"Training completed. Best checkpoint saved at: {best_ckpt}")
+        print(f"Training completed. Latest checkpoint: {last_ckpt}; historical best Dice={best_val_dice:.6f}")
 
     if is_distributed:
         dist.destroy_process_group()

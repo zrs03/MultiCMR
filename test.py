@@ -33,6 +33,7 @@ except ImportError as exc:
 from models import MMFormerAnatomy
 from preprocess.processing import validate_output_sizes
 from utils.inference import predict_cine
+from utils.checkpoint import ARCHITECTURE
 from utils import MultiSourceNiftiDataset3D, load_cases_from_yaml, multiclass_dice_iou_hd95
 
 VIEWS = ('2ch', '4ch', 'sa')
@@ -176,8 +177,8 @@ def main():
     if args.sax_size:
         sizes['sa'] = args.sax_size
     sizes = validate_output_sizes(sizes)
-    if checkpoint.get('architecture') != 'center_window_lax_3d_sax_v1':
-        raise ValueError('Checkpoint is not a center-window model. Regenerate preprocessing and retrain; old 64-channel/2D+t heads are incompatible.')
+    if checkpoint.get('architecture') != ARCHITECTURE:
+        raise ValueError('Checkpoint is not a FiLM center-window model. Retrain with the FiLM architecture; cross-attention and older heads are incompatible.')
     cfg = dict(checkpoint['model_config'])
     if any(sizes[v][0] != cfg['temporal_size'] for v in VIEWS[:2]):
         raise ValueError('Window size differs between checkpoint and requested preprocessing')

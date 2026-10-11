@@ -31,6 +31,9 @@ fi
 train_args=(--split-yaml "$SPLIT_YAML" --output-dir "$OUTPUT_DIR"
             --batch-size "$BATCH_SIZE" --num-workers "$NUM_WORKERS"
             --epochs "$EPOCHS" --lr "$LR" "${size_args[@]}")
+if [[ -n "${RESUME:-}" ]]; then
+  train_args+=(--resume "$RESUME")
+fi
 case "$MODE" in
   preprocess)
     python -m preprocess.preprocess --data-root "$DATA_ROOT" --output-yaml "$SPLIT_YAML" \
@@ -61,10 +64,11 @@ Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
   test: sliding windows reconstruct native LAX frames; average SAX probabilities; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
   CHECKPOINT, DEVICE, BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, NUM_GPUS, GPU_DEVICES,
-  LAX_SIZE, SAX_SIZE, SPLIT, EVAL_MODE.
+  LAX_SIZE, SAX_SIZE, SPLIT, EVAL_MODE, RESUME (checkpoint path; EPOCHS is total target).
 Examples:
   bash run.sh preprocess
   DEVICE=cuda:0 bash run.sh train
+  RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-multi-gpu
   SPLIT=test EVAL_MODE=all-seven bash run.sh test
   EF_DATA_DIR=/path/to/original_space_masks bash run.sh eval-ef
 EOF

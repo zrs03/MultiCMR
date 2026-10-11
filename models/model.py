@@ -3,7 +3,7 @@ LAX time is folded into input channels; SAX retains its 3D encoder/decoder.
 M2FTrans-inspired: P learnable fusion tokens for P spatial feature patches.
 Additional: 5 learnable anatomy tokens (LV_myo, LV_cav, RV_cav, RA, LA).
 No hard anatomical routing. Missing views excluded as attention keys.
-Anatomy tokens are injected through class-aware decoder cross-attention.
+Anatomy tokens condition per-view, per-scale FiLM in the decoders.
 This is a research adaptation, not an exact reimplementation of M2FTrans.
 """
 from __future__ import annotations
@@ -201,43 +201,46 @@ class FusionAnatomyTransformer(nn.Module):
         return views_out, chunks[-2], chunks[-1]
 
 
-class AnatomyDecoderInjection(nn.Module):
-    """Voxel features query anatomy tokens; residual anatomy context is injected."""
-    def __init__(self, channels: int, dim: int, spatial_dims: int = 3):
+class AnatomyFiLM(nn.Module):
+    """Selected anatomy tokens generate spatially shared channel modulation."""
+    def __init__(self, channels: int, dim: int, num_tokens: int):
         super().__init__()
-        conv = nn.Conv2d if spatial_dims == 2 else nn.Conv3d
-        self.query = conv(channels, dim, kernel_size=1)
-        self.key = nn.Linear(dim, dim)
-        self.value = nn.Linear(dim, channels)
-        self.gate = nn.Parameter(torch.tensor(0.1))
-        self.scale = dim ** -0.5
+        self.channels = channels
+        self.num_tokens = num_tokens
+        self.token_norm = nn.LayerNorm(dim)
+        self.generator = nn.Sequential(
+            nn.Linear(num_tokens * dim, dim), nn.SiLU(), nn.Linear(dim, 2 * channels))
+        # Identity at initialization: F' = (1 + delta_gamma) * F + beta.
+        nn.init.zeros_(self.generator[-1].weight)
+        nn.init.zeros_(self.generator[-1].bias)
+
     def forward(self, feat: Tensor, anatomy: Tensor, class_available: Tensor):
-        b, channels = feat.shape[:2]
-        q = self.query(feat).flatten(2).transpose(1, 2)  # [B, voxels, dim]
-        k = self.key(anatomy)                           # [B, 5, dim]
-        v = self.value(anatomy)                         # [B, 5, channels]
-        scores = (q @ k.transpose(1, 2)) * self.scale
-        scores = scores.masked_fill(~class_available[None, None, :],
-                                    torch.finfo(scores.dtype).min)
-        weights = scores.softmax(dim=-1)
-        context = (weights @ v).transpose(1, 2).reshape(b, channels, *feat.shape[2:])
-        return feat + torch.tanh(self.gate) * context
+        selected = anatomy[:, class_available.bool(), :]
+        if selected.shape[1] != self.num_tokens:
+            raise ValueError('Anatomy availability does not match FiLM token count')
+        condition = self.token_norm(selected).flatten(1)
+        delta_gamma, beta = self.generator(condition).chunk(2, dim=1)
+        shape = (feat.shape[0], self.channels) + (1,) * (feat.ndim - 2)
+        return feat * (1 + delta_gamma.reshape(shape)) + beta.reshape(shape)
 
 
 class AnatomyAwareProgressiveDecoder(nn.Module):
-    def __init__(self, base: int, dim: int, spatial_dims: int = 3):
+    def __init__(self, base: int, dim: int, view_token_counts: Mapping[str, int],
+                 spatial_dims: int = 3):
         super().__init__()
         self.d3 = UpFuse(dim, base * 4, base * 4, spatial_dims)
         self.d2 = UpFuse(base * 4, base * 2, base * 2, spatial_dims)
         self.d1 = UpFuse(base * 2, base, base, spatial_dims)
-        self.a3 = AnatomyDecoderInjection(base * 4, dim, spatial_dims)
-        self.a2 = AnatomyDecoderInjection(base * 2, dim, spatial_dims)
-        self.a1 = AnatomyDecoderInjection(base, dim, spatial_dims)
-    def forward(self, skips: Sequence[Tensor], anatomy: Tensor, availability: Tensor):
+        # Convolutions can be shared across views, but FiLM generators are not.
+        self.a3 = nn.ModuleDict({v: AnatomyFiLM(base * 4, dim, n) for v, n in view_token_counts.items()})
+        self.a2 = nn.ModuleDict({v: AnatomyFiLM(base * 2, dim, n) for v, n in view_token_counts.items()})
+        self.a1 = nn.ModuleDict({v: AnatomyFiLM(base, dim, n) for v, n in view_token_counts.items()})
+
+    def forward(self, skips: Sequence[Tensor], anatomy: Tensor, availability: Tensor, view: str):
         s1, s2, s3, bottleneck = skips
-        d3 = self.a3(self.d3(bottleneck, s3), anatomy, availability)
-        d2 = self.a2(self.d2(d3, s2), anatomy, availability)
-        d1 = self.a1(self.d1(d2, s1), anatomy, availability)
+        d3 = self.a3[view](self.d3(bottleneck, s3), anatomy, availability)
+        d2 = self.a2[view](self.d2(d3, s2), anatomy, availability)
+        d1 = self.a1[view](self.d1(d2, s1), anatomy, availability)
         return d1, d2, d3
 
 
@@ -284,8 +287,10 @@ class MMFormerAnatomy(nn.Module):
         self.inter = FusionAnatomyTransformer(dim, heads, token_grid, inter_layers)
         self.context_scale = nn.Parameter(torch.tensor(.1))
         self.fusion_scale = nn.Parameter(torch.tensor(.1))
-        self.decoder = AnatomyAwareProgressiveDecoder(base, dim)
-        self.decoder_2d = AnatomyAwareProgressiveDecoder(base, dim, spatial_dims=2)
+        token_counts = {v: int(getattr(self, f'anatomy_available_{v}').sum()) for v in VIEWS}
+        self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']})
+        self.decoder_2d = AnatomyAwareProgressiveDecoder(
+            base, dim, {v: token_counts[v] for v in VIEWS[:2]}, spatial_dims=2)
         # LAX heads predict only the center frame.
         output_channels = dict(self.num_classes_by_source)
         self.heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
@@ -380,7 +385,7 @@ class MMFormerAnatomy(nn.Module):
             sk[-1] = sk[-1] + self.context_scale * patch + self.fusion_scale * context
             anatomy = anatomy_tokens.index_select(0, indices)
             d1, d2, d3 = decoder(sk, anatomy,
-                                  getattr(self, f'anatomy_available_{view}'))
+                                  getattr(self, f'anatomy_available_{view}'), view)
 
             def restore(pred):
                 size = output_shape[-2:] if is_2d else output_shape[2:]
