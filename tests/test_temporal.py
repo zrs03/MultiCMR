@@ -64,7 +64,7 @@ class TemporalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             case, sizes = self.make_case(d)
             full = MultiSourceNiftiDataset3D([case], sizes)[0]
-            dataset = MultiSourceNiftiDataset3D([case], sizes, augment=True)
+            dataset = MultiSourceNiftiDataset3D([case], sizes, augment=True, affine_prob=0)
             for _ in range(4):
                 item = dataset[0]
                 for v in VIEWS:
@@ -74,7 +74,7 @@ class TemporalTests(unittest.TestCase):
             self.assertEqual(batch['image']['sa'].shape, (1, 1, 16, 16, 24))
             # Spatial flips applied to an entire cine never reorder its frames.
             with patch('numpy.random.rand', return_value=0.):
-                augmented = MultiSourceNiftiDataset3D([case], sizes, augment=True)[0]
+                augmented = MultiSourceNiftiDataset3D([case], sizes, augment=True, affine_prob=0)[0]
             torch.testing.assert_close(augmented['image']['2ch'], full['image']['2ch'].flip((-2, -1)))
 
     def test_offline_split_native_frames_and_shared_sax(self):

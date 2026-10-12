@@ -13,6 +13,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from models import MMFormerAnatomy
+from utils.sampling import PatientWindowSampler
 from utils.checkpoint import ARCHITECTURE, atomic_save, capture_rng_state, restore_training_state
 from preprocess.processing import validate_output_sizes
 from utils import (
@@ -242,6 +243,11 @@ def main():
     parser.add_argument('--inter-layers', type=int, default=2, help='Total layers: 1 anatomy-routed + N-1 global; minimum 2')
     parser.add_argument('--aux-weight', type=float, default=.2)
     parser.add_argument('--deep-weight', type=float, default=.1)
+    parser.add_argument('--windows-per-patient', type=int, default=4, help='Max distinct windows per patient per epoch; 0 uses all')
+    parser.add_argument('--affine-prob', type=float, default=.5)
+    parser.add_argument('--rotation-degrees', type=float, default=10.)
+    parser.add_argument('--translation-fraction', type=float, default=.05)
+    parser.add_argument('--scale-fraction', type=float, default=.1)
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--resume", default=None, help="Checkpoint path to resume; --epochs is the total target epoch")
@@ -357,6 +363,8 @@ def main():
         output_sizes=output_sizes,
         source_num_classes=num_classes_by_source,
         augment=True,
+        affine_prob=args.affine_prob, rotation_degrees=args.rotation_degrees,
+        translation_fraction=args.translation_fraction, scale_fraction=args.scale_fraction,
     )
     val_dataset = MultiSourceNiftiDataset3D(
         cases=val_cases,
@@ -365,12 +373,16 @@ def main():
         augment=False,
     )
 
-    if is_distributed:
-        train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
-        val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
-    else:
-        train_sampler = None
-        val_sampler = None
+    train_sampler = PatientWindowSampler(train_cases, args.windows_per_patient, args.seed,
+                                         rank=rank, num_replicas=world_size)
+    val_sampler = (DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+                   if is_distributed else None)
+    if is_master_proc(rank):
+        print(f'[MultiCMR] Patients={len(train_sampler.groups)}; selected windows/epoch='
+              f'{train_sampler.selected_count}; DDP padded total={train_sampler.total_size}; '
+              f'windows/rank={len(train_sampler)}; steps/rank={(len(train_sampler) + args.batch_size - 1) // args.batch_size}')
+        print(f'[MultiCMR] Spatial affine: probability={args.affine_prob}, rotation=±{args.rotation_degrees}deg, '
+              f'translation=±{args.translation_fraction}, scale=1±{args.scale_fraction}; validation=all windows, no augmentation')
 
     train_loader = DataLoader(
         train_dataset,
@@ -428,8 +440,7 @@ def main():
             print(f'Checkpoint already reached target epoch {args.epochs}; no training steps needed.')
 
     for epoch in range(start_epoch, args.epochs + 1):
-        if is_distributed and train_sampler is not None:
-            train_sampler.set_epoch(epoch)
+        train_sampler.set_epoch(epoch)
 
         epoch_start = time.time()
 
@@ -500,7 +511,7 @@ def main():
 
             elapsed = time.time() - epoch_start
             line = (
-                f"Epoch {epoch:03d} | {elapsed:.1f}s | "
+                f"Epoch {epoch:03d} | {elapsed:.1f}s | train_steps={len(train_loader)} | "
                 f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} mean_val_dice={mean_val_dice:.4f}\n"
             )
             for src in source_order:

@@ -51,7 +51,7 @@ NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
 
 训练仍均匀采样 7 种非空模态掩码；每条数据包含 SAX，但随机掩码可将它屏蔽。验证使用完整模态。缺失视图不编码、不作为 attention key/value、不计入监督。长轴 Dice+CE、边界损失及指标为中心帧二维计算；SAX 为三维计算。窗口内所有帧与中心标签采用一致的空间翻转。
 
-日志中的训练/验证数量现在是**窗口数**。一个 epoch 遍历所有窗口，步骤数比原来的病例级 epoch 大；SAX 在每个窗口参与监督。训练脚本的 val Dice 是窗口加权统计（SAX 也按窗口计数），与独立 test.py 的病例级重建分数不同，帧数不同的病例权重不同。原来的 200 epochs 不再代表相同训练预算，请结合窗口总数调整 EPOCHS。
+日志中的缓存数量是**窗口数**。训练默认每患者每轮随机抽取最多 4 个不同窗口，验证仍遍历全部窗口；SAX 在选中的窗口参与监督。训练脚本的 val Dice 是窗口加权统计（SAX 也按窗口计数），与独立 test.py 的病例级重建分数不同，帧数不同的病例权重不同。窗口抽样改变了每轮训练步数，请按日志中的 train_steps 比较总优化步数，不能仅比较 epoch 数。
 
 ## 完整序列评估
 
@@ -91,3 +91,20 @@ RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-mult
 FiLM 最后一层权重和偏置零初始化，因此初始为恒等映射。主分割和深监督经调制特征输出；辅助 decoder 仍不使用解剖调制。模态掩码和 patch 机制保留；fusion tokens 已移除。这是通道级全局条件调制，不保证某个 token 仅影响对应器官像素。
 
 窗口预处理缓存可继续使用，无须重新拆分。旧 fusion-token/cross-attention checkpoint 不支持直接测试或完整 resume，需重新训练 FiLM 模型；建议指定新的 OUTPUT_DIR 避免覆盖旧实验。
+
+## 患者窗口采样与空间增强
+
+默认 `--windows-per-patient 4`：每轮每患者无放回抽取最多 4 个窗口，窗口不足时全部使用；每轮通过 seed + epoch 重新生成抽样。`0` 恢复全部窗口。多 GPU 使用相同全局抽样后分片，为保证各 rank 训练步数一致，会最少量重复补齐至 world size 的整数倍；补齐数在启动日志中可见。恢复训练时使用保存的下一 epoch，保持相同 seed 和采样参数即可复现对应轮次的样本选择。此参数是当前命令配置，不从旧 checkpoint 自动覆盖。
+
+训练保留原有翻转，并以默认 0.5 概率对每视图独立应用小幅平面内仿射：旋转 ±10°，H/W 平移各不超过对应尺寸 5%，等比例缩放 0.9–1.1 倍。长轴同一窗口的全部帧与中心标签共享同一个变换；SAX 所有层与标签共享同一个 H/W 变换，不混合深度。图像双线性插值、标签最近邻，超出范围补 0。不同视图坐标系不同，不强制复用相同变换。未新增强度、gamma、噪声或偏置场增强。验证和测试关闭增强且覆盖全部窗口。
+
+```bash
+WINDOWS_PER_PATIENT=4 bash run.sh train-multi-gpu
+WINDOWS_PER_PATIENT=8 bash run.sh train
+# 对照：使用全部窗口，关闭新增仿射（保留原有翻转）
+WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
+# 自定义较弱空间增强
+ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
+```
+
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，现有 two-stage FiLM checkpoint 可继续 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。

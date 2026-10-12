@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from preprocess.processing import VIEWS, load_view, validate_output_sizes
+from .augmentation import random_spatial_affine
 
 # ============================================================
 # Case definition
@@ -271,7 +272,13 @@ class MultiSourceNiftiDataset3D(Dataset):
 
     def __init__(self, cases: Sequence[CaseItem], output_sizes=None,
                  source_num_classes: Dict[str, int] = None, augment: bool = False,
-                 load_anno: bool = True, complete_cine: bool = False):
+                 load_anno: bool = True, complete_cine: bool = False,
+                 affine_prob=.5, rotation_degrees=10., translation_fraction=.05, scale_fraction=.1):
+        if not (0 <= affine_prob <= 1 and 0 <= rotation_degrees <= 180 and
+                0 <= translation_fraction < 1 and 0 <= scale_fraction < 1):
+            raise ValueError('Invalid affine augmentation bounds')
+        self.affine_config = dict(probability=affine_prob, degrees=rotation_degrees,
+                                  translate=translation_fraction, scale=scale_fraction)
         self.cases = list(cases)
         self.complete_cine = complete_cine
         self.output_sizes = validate_output_sizes(output_sizes)
@@ -308,6 +315,7 @@ class MultiSourceNiftiDataset3D(Dataset):
                         if label is not None:
                             label_axis = axis - 1 if source != 'sa' and not self.complete_cine else axis
                             label = np.flip(label, axis=label_axis)
+                image, label = random_spatial_affine(image, label, **self.affine_config)
             images[source] = torch.from_numpy(np.ascontiguousarray(image)).float().unsqueeze(0)
             if label is not None:
                 masks[source] = torch.from_numpy(np.ascontiguousarray(label)).long()

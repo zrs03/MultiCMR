@@ -30,7 +30,10 @@ if [[ -n "${SAX_SIZE:-}" ]]; then
 fi
 train_args=(--split-yaml "$SPLIT_YAML" --output-dir "$OUTPUT_DIR"
             --batch-size "$BATCH_SIZE" --num-workers "$NUM_WORKERS"
-            --epochs "$EPOCHS" --lr "$LR" "${size_args[@]}")
+            --epochs "$EPOCHS" --lr "$LR" "${size_args[@]}"
+            --windows-per-patient "${WINDOWS_PER_PATIENT:-4}"
+            --affine-prob "${AFFINE_PROB:-0.5}" --rotation-degrees "${ROTATION_DEGREES:-10}"
+            --translation-fraction "${TRANSLATION_FRACTION:-0.05}" --scale-fraction "${SCALE_FRACTION:-0.1}")
 if [[ -n "${RESUME:-}" ]]; then
   train_args+=(--resume "$RESUME")
 fi
@@ -63,6 +66,8 @@ Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
   train: paired LAX windows + shared SAX; center-frame supervision
   test: sliding windows reconstruct native LAX frames; average SAX probabilities; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
+  WINDOWS_PER_PATIENT (default 4; 0=all), AFFINE_PROB, ROTATION_DEGREES,
+  TRANSLATION_FRACTION, SCALE_FRACTION,
   CHECKPOINT, DEVICE, BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, NUM_GPUS, GPU_DEVICES,
   LAX_SIZE, SAX_SIZE, SPLIT, EVAL_MODE, RESUME (checkpoint path; EPOCHS is total target).
 Examples:
