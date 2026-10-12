@@ -239,7 +239,7 @@ def main():
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--token-grid', nargs=3, type=int, default=(2, 4, 4))
     parser.add_argument('--intra-layers', type=int, default=1)
-    parser.add_argument('--inter-layers', type=int, default=2)
+    parser.add_argument('--inter-layers', type=int, default=2, help='Total layers: 1 anatomy-routed + N-1 global; minimum 2')
     parser.add_argument('--aux-weight', type=float, default=.2)
     parser.add_argument('--deep-weight', type=float, default=.1)
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size per GPU")
@@ -338,7 +338,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a FiLM center-window checkpoint; cross-attention and older architectures are incompatible')
+            raise ValueError('Resume requires a two-stage FiLM checkpoint without fusion tokens; older architectures are incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):
             raise ValueError('Resume checkpoint source order differs from current data')
         if resume_checkpoint['num_classes_by_source'] != num_classes_by_source:

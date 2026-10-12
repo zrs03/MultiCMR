@@ -1,10 +1,6 @@
-"""Multi-view cardiac MRI segmentation with learnable fusion and anatomy tokens.
-LAX time is folded into input channels; SAX retains its 3D encoder/decoder.
-M2FTrans-inspired: P learnable fusion tokens for P spatial feature patches.
-Additional: 5 learnable anatomy tokens (LV_myo, LV_cav, RV_cav, RA, LA).
-No hard anatomical routing. Missing views excluded as attention keys.
-Anatomy tokens condition per-view, per-scale FiLM in the decoders.
-This is a research adaptation, not an exact reimplementation of M2FTrans.
+"""Center-window LAX and 3D SAX with anatomy-routed then global attention.
+Five anatomy tokens condition per-view, per-scale decoder FiLM.
+Missing views are excluded from attention keys in both stages.
 """
 from __future__ import annotations
 from math import prod
@@ -52,30 +48,38 @@ class TransformerBlock(nn.Module):
     def forward(self, x: Tensor, attn_mask: Optional[Tensor] = None,
                 key_padding_mask: Optional[Tensor] = None) -> Tensor:
         y = self.n1(x)
-        if y.shape[1] <= self.query_chunk_size or attn_mask is not None:
+        if y.shape[1] <= self.query_chunk_size:
             y, _ = self.attn(y, y, y, attn_mask=attn_mask,
                              key_padding_mask=key_padding_mask, need_weights=False)
         else:
-            # Exact global attention with bounded query chunks. Each chunk still
-            # attends ALL keys; this never pools/drops patches or separates time.
+            # Exact attention with bounded query chunks. Each chunk sees all keys
+            # allowed by the routing and missing-view masks; no patch pooling.
             batch, length, dim = y.shape
             heads = self.attn.num_heads
             q, k, v = F.linear(y, self.attn.in_proj_weight, self.attn.in_proj_bias).chunk(3, -1)
             q, k, v = (a.reshape(batch, length, heads, dim // heads).transpose(1, 2)
                        for a in (q, k, v))
-            allowed = None if key_padding_mask is None else ~key_padding_mask[:, None, None, :]
+            if attn_mask is not None and (attn_mask.dtype != torch.bool or attn_mask.ndim != 2):
+                raise ValueError('Chunked attention expects a 2D boolean blocked-edge mask')
 
-            def attend(query, key, value):
+            def attend(query, key, value, allowed):
                 return F.scaled_dot_product_attention(
                     query, key, value, attn_mask=allowed,
                     dropout_p=self.attn.dropout if self.training else 0.)
 
             chunks = []
-            for query in q.split(self.query_chunk_size, dim=2):
+            for start in range(0, length, self.query_chunk_size):
+                query = q[:, :, start:start + self.query_chunk_size]
+                allowed = None
+                if attn_mask is not None:
+                    allowed = ~attn_mask[None, None, start:start + self.query_chunk_size, :]
+                if key_padding_mask is not None:
+                    keys_allowed = ~key_padding_mask[:, None, None, :]
+                    allowed = keys_allowed if allowed is None else allowed & keys_allowed
                 if self.training and torch.is_grad_enabled():
-                    chunk = checkpoint(attend, query, k, v, use_reentrant=False)
+                    chunk = checkpoint(attend, query, k, v, allowed, use_reentrant=False)
                 else:
-                    chunk = attend(query, k, v)
+                    chunk = attend(query, k, v, allowed)
                 chunks.append(chunk)
             y = torch.cat(chunks, dim=2).transpose(1, 2).reshape(batch, length, dim)
             y = self.attn.out_proj(y)
@@ -165,40 +169,57 @@ class ProgressiveDecoder(nn.Module):
         return d1, d2, d3
 
 
-class FusionAnatomyTransformer(nn.Module):
-    """Joint self attention over [three-view patches, P fusion tokens, 5 anatomy tokens]."""
-    def __init__(self, dim: int, heads: int, grid: Tuple[int, int, int], layers: int = 2,
+class TwoStageAnatomyTransformer(nn.Module):
+    """Stage 1: view/anatomy routing. Stage 2: global available-token attention."""
+    def __init__(self, dim: int, heads: int, view_anatomy: Tensor, layers: int = 2,
                  dropout: float = .1):
         super().__init__()
-        self.fusion_grid = nn.Parameter(torch.randn(1, dim, *grid) * .02)
+        if layers < 2:
+            raise ValueError('inter_layers must be >= 2: one routed layer, then global layers')
+        self.register_buffer('view_anatomy', view_anatomy.to(dtype=torch.bool).clone())
         self.anatomy_tokens = nn.Parameter(torch.randn(1, 5, dim) * .02)
-        self.layers = nn.ModuleList([TransformerBlock(dim, heads, dropout) for _ in range(layers)])
+        self.routed_layer = TransformerBlock(dim, heads, dropout)
+        self.global_layers = nn.ModuleList([TransformerBlock(dim, heads, dropout) for _ in range(layers - 1)])
         self.norm = nn.LayerNorm(dim)
-        self.heads = heads
-    def forward(self, tokens: Mapping[str, Tensor], present: Tensor,
-                patch_shape: Tuple[int, int, int]):
-        """Keep native 2D/3D patches; fusion tokens use the SAX bottleneck grid."""
-        b = tokens['sa'].shape[0]
-        if present.shape != (b, 3):
-            raise ValueError('Expected present [B,3]')
+
+    def routing_mask(self, lengths: Sequence[int], device):
+        """True blocks an edge. Do not infer organ membership of individual patches."""
+        total = sum(lengths)
+        blocked = torch.ones(total + 5, total + 5, device=device, dtype=torch.bool)
+        start = 0
+        for i, length in enumerate(lengths):
+            end = start + length
+            blocked[start:end, start:end] = False
+            blocked[start:end, total:] = ~self.view_anatomy[i][None, :]
+            blocked[total:, start:end] = ~self.view_anatomy[i][:, None]
+            start = end
+        # Every anatomy query has at least its own valid key, even if all
+        # views containing that anatomy are missing in this sample.
+        blocked[total:, total:] = ~torch.eye(5, device=device, dtype=torch.bool)
+        return blocked
+
+    def forward(self, tokens: Mapping[str, Tensor], present: Tensor):
+        batch = tokens['sa'].shape[0]
+        if present.shape != (batch, 3) or not present.bool().any(dim=1).all():
+            raise ValueError('Expected nonempty present mask [B,3]')
         lengths = [tokens[v].shape[1] for v in VIEWS]
-        p = prod(patch_shape)
-        fusion = F.interpolate(self.fusion_grid, size=patch_shape, mode='trilinear',
-                               align_corners=False).flatten(2).transpose(1, 2).expand(b, -1, -1)
-        anatomy = self.anatomy_tokens.expand(b, -1, -1)
-        x = torch.cat([*(tokens[v] for v in VIEWS), fusion, anatomy], dim=1)
+        # Sanitize absent views before any attention (also protects against NaNs).
+        patches = [tokens[v].masked_fill(~present[:, i, None, None].bool(), 0)
+                   for i, v in enumerate(VIEWS)]
+        anatomy = self.anatomy_tokens.expand(batch, -1, -1)
+        x = torch.cat([*patches, anatomy], dim=1)
         missing = torch.cat([
             *(~present[:, i:i+1].bool().expand(-1, n) for i, n in enumerate(lengths)),
-            torch.zeros(b, p + 5, device=x.device, dtype=torch.bool),
+            torch.zeros(batch, 5, device=x.device, dtype=torch.bool),
         ], dim=1)
-        # Missing tokens never act as keys/values; their query outputs are discarded.
-        # Fusion/anatomy keys remain available, so no softmax row is fully masked.
-        for layer in self.layers:
+        x = self.routed_layer(x, attn_mask=self.routing_mask(lengths, x.device),
+                              key_padding_mask=missing)
+        for layer in self.global_layers:
             x = layer(x, key_padding_mask=missing)
-        chunks = self.norm(x).split([*lengths, p, 5], dim=1)
-        views_out = {v: chunks[i] * present[:, i, None, None].to(x.dtype)
+        chunks = self.norm(x).split([*lengths, 5], dim=1)
+        views_out = {v: chunks[i].masked_fill(~present[:, i, None, None].bool(), 0)
                      for i, v in enumerate(VIEWS)}
-        return views_out, chunks[-2], chunks[-1]
+        return views_out, chunks[-1]
 
 
 class AnatomyFiLM(nn.Module):
@@ -245,7 +266,7 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
 
 
 class MMFormerAnatomy(nn.Module):
-    """M2FTrans-inspired learnable fusion tokens + 5 anatomy tokens for 3 MRI views."""
+    """Anatomy-routed/global patch attention and anatomy-conditioned FiLM."""
     def __init__(self, in_channels: int = 1,
                  num_classes_by_source: Optional[Dict[str, int]] = None,
                  source_order: Sequence[str] = VIEWS,
@@ -259,8 +280,8 @@ class MMFormerAnatomy(nn.Module):
             raise ValueError(f'source_order must be {VIEWS}')
         if dim % heads:
             raise ValueError('dim must be divisible by heads')
-        if inter_layers < 1:
-            raise ValueError('inter_layers must be positive')
+        if inter_layers < 2:
+            raise ValueError('inter_layers must be >= 2 for routed and global attention')
         if predict_missing:
             raise ValueError('Missing-view synthesis is not supported')
         self.num_classes_by_source = num_classes_by_source or {'2ch': 3, '4ch': 6, 'sa': 4}
@@ -284,9 +305,10 @@ class MMFormerAnatomy(nn.Module):
                                                   intra_layers, heads, temporal_size))
             for v in VIEWS})
         self.modality_embedding = nn.Parameter(torch.randn(3, 1, dim) * .02)
-        self.inter = FusionAnatomyTransformer(dim, heads, token_grid, inter_layers)
+        self.inter = TwoStageAnatomyTransformer(
+            dim, heads, torch.stack([getattr(self, f'anatomy_available_{v}') for v in VIEWS]),
+            inter_layers)
         self.context_scale = nn.Parameter(torch.tensor(.1))
-        self.fusion_scale = nn.Parameter(torch.tensor(.1))
         token_counts = {v: int(getattr(self, f'anatomy_available_{v}').sum()) for v in VIEWS}
         self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']})
         self.decoder_2d = AnatomyAwareProgressiveDecoder(
@@ -355,9 +377,8 @@ class MMFormerAnatomy(nn.Module):
                 tokfull = image.new_zeros((batch, patches, self.dim))
             skip_maps[view] = skips
             view_tokens[view] = tokfull + self.modality_embedding[i] * present[:, i, None, None]
-        fused, fusion_tokens, anatomy_tokens = self.inter(view_tokens, present, patch_shapes['sa'])
+        fused, anatomy_tokens = self.inter(view_tokens, present)
         logits, aux_logits, deep_logits = {}, {}, {}
-        shared_context = fusion_tokens.transpose(1, 2).reshape(batch, self.dim, *patch_shapes['sa'])
         for i, view in enumerate(VIEWS):
             indices = present[:, i].nonzero(as_tuple=True)[0]
             nclasses = self.num_classes_by_source[view]
@@ -375,14 +396,7 @@ class MMFormerAnatomy(nn.Module):
             sk = [f.index_select(0, indices) for f in skip_maps[view]]
             patch = fused[view].index_select(0, indices).transpose(1, 2)
             patch = patch.reshape(indices.numel(), self.dim, *patch_shapes[view])
-            context = shared_context.index_select(0, indices)
-            if is_2d:
-                # Project the shared 3D fusion grid onto the LAX 2D feature grid.
-                context = F.interpolate(context.mean(dim=2), size=patch_shapes[view][-2:],
-                                        mode='bilinear', align_corners=False)
-            else:
-                context = F.interpolate(context, size=patch_shapes[view], mode=mode, align_corners=False)
-            sk[-1] = sk[-1] + self.context_scale * patch + self.fusion_scale * context
+            sk[-1] = sk[-1] + self.context_scale * patch
             anatomy = anatomy_tokens.index_select(0, indices)
             d1, d2, d3 = decoder(sk, anatomy,
                                   getattr(self, f'anatomy_available_{view}'), view)
@@ -399,7 +413,7 @@ class MMFormerAnatomy(nn.Module):
                 aux1, _, _ = aux_decoder([f.index_select(0, indices) for f in skip_maps[view]])
                 aux_logits[view] = restore(self.aux_heads[view](aux1))
         return dict(logits=logits, aux_logits=aux_logits, deep_logits=deep_logits,
-                    pred_tokens=fused, fusion_tokens=fusion_tokens,
+                    pred_tokens=fused,
                     anatomy_tokens=anatomy_tokens, valid_views=present, patch_shapes=patch_shapes)
 
 
@@ -429,7 +443,6 @@ if __name__ == '__main__':
          'sa': torch.randn(2, 1, 16, 32, 32)}
     present = torch.tensor([[1, 0, 1], [0, 1, 0]], dtype=torch.bool)
     result = model(x, present)
-    print('Fusion:', tuple(result['fusion_tokens'].shape))
     print('Anatomy:', tuple(result['anatomy_tokens'].shape))
     for k, v in result['logits'].items():
         print(k, tuple(v.shape))
@@ -438,7 +451,6 @@ if __name__ == '__main__':
     loss = masked_segmentation_loss(result, targets)
     loss.backward()
     assert torch.isfinite(loss)
-    assert model.inter.fusion_grid.grad is not None
     assert model.inter.anatomy_tokens.grad is not None
     model.eval()
     with torch.no_grad():

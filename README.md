@@ -1,6 +1,6 @@
 # MultiCMR
 
-2CH/4CH 使用以目标帧为中心的 **5 帧时间窗**，2D encoder/decoder 只预测中心帧；每个训练样本同时包含同病例 SAX 体积。原生 patch、fusion tokens、anatomy tokens 和缺失模态掩码保留，SAX 使用 3D encoder/decoder。
+2CH/4CH 使用以目标帧为中心的 **5 帧时间窗**，2D encoder/decoder 只预测中心帧；每个训练样本同时包含同病例 SAX 体积。使用原生 patch、5 个 anatomy tokens、两阶段 attention 和缺失模态掩码，不使用 fusion tokens，SAX 使用 3D encoder/decoder。
 
 | 模态 | 缓存图像          | 缓存标签          | 批量输入              | 分割 logits           |
 | ---- | ----------------- | ----------------- | --------------------- | --------------------- |
@@ -40,7 +40,14 @@ NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
 
 模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 转成 `[B,K,H,W]` 输入 2D encoder，亦支持直接传入后者。`temporal_size` 配置现在表示正奇数窗口长度，默认 5。两个长轴视图仍各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。辅助头、深监督头也只监督长轴中心帧。
 
-默认尺寸下，每个长轴窗口生成 256 个 patch tokens，SAX 为 4096 个；1×1 patch embedding、空间位置编码、模态内 Transformer、联合 attention、4096 个 fusion tokens 和 5 个 anatomy tokens 保留。时间相对位置由窗口通道顺序表达。共享三维 fusion 特征沿深度平均后投影到长轴二维网格。attention 使用 query 分块和训练 checkpoint 重算。
+默认尺寸下，每个长轴窗口生成 256 个 patch tokens，SAX 为 4096 个，另有 5 个 anatomy tokens，联合序列长度为 **4613**。1×1 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，已无 fusion grid、fusion tokens 或共享三维 fusion context 支路。更新后的各视图 patches 残差注入对应 bottleneck，解剖 tokens 通过 FiLM 调制解码器。
+
+跨视图 attention 分两阶段：
+
+1. **解剖关联更新**：patch queries 只能关注本视图 patches 和该视图包含的 anatomy tokens；anatomy queries 只能关注包含该结构的视图 patches 和自身。禁止跨视图 patch 直接连接、禁止不同 anatomy tokens 直接连接。左室心肌/左室腔关联三视图，右室腔关联 4CH/SAX，心房关联 4CH。这里是视图级标签先验，不用 GT 推断每个 patch 的器官类别。
+2. **全局更新**：全部可用视图 patches 和 5 个 anatomy tokens 做联合 self-attention。两阶段均屏蔽缺失视图的 keys/values，缺失视图输出不监督。
+
+`--inter-layers` 表示两阶段总层数，默认 2、最小 2：第一阶段固定 1 层，其余层属于第二阶段。每个 anatomy token 的第一阶段 self-edge 保证其相关视图缺失时也不产生全屏蔽 attention 行。两阶段均支持 query 分块和训练 checkpoint 重算，第一阶段按块组合结构路由与模态掩码。
 
 训练仍均匀采样 7 种非空模态掩码；每条数据包含 SAX，但随机掩码可将它屏蔽。验证使用完整模态。缺失视图不编码、不作为 attention key/value、不计入监督。长轴 Dice+CE、边界损失及指标为中心帧二维计算；SAX 为三维计算。窗口内所有帧与中心标签采用一致的空间翻转。
 
@@ -59,7 +66,7 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_film_lax_3d_sax_v2`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_two_stage_film_v3`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
@@ -73,14 +80,14 @@ RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-mult
 
 `--epochs` / `EPOCHS` 是目标总轮数：checkpoint 完成第 100 轮时，以上命令执行第 101–300 轮。日志追加而非清空。模型结构自动采用 checkpoint 配置，数据窗口尺寸、类别和视图顺序必须匹配；优化器恢复保存的学习率，`--lr` 不会覆盖完整续训的学习率。数据路径、batch size、worker 数、损失权重等沿用当前命令，建议与原训练保持一致。
 
-支持从 best 或 last 续训；last 通常包含最近进度。同架构 FiLM checkpoint 只有模型权重时会明确告警：加载权重，但优化器/调度器重新初始化，epoch 从 1 开始。旧 cross-attention 和 64 通道架构仍不兼容。更改 GPU 数量可继续训练，但随机数流无法按原 rank 对应恢复，会告警；不保证与原训练轨迹一致。续训从完整 epoch 边界开始，不恢复中断 epoch 内尚未保存的 batch。
+支持从 best 或 last 续训；last 通常包含最近进度。同架构 FiLM checkpoint 只有模型权重时会明确告警：加载权重，但优化器/调度器重新初始化，epoch 从 1 开始。旧 fusion-token、cross-attention 和 64 通道架构仍不兼容。更改 GPU 数量可继续训练，但随机数流无法按原 rank 对应恢复，会告警；不保证与原训练轨迹一致。续训从完整 epoch 边界开始，不恢复中断 epoch 内尚未保存的 batch。
 
 指定新的 OUTPUT_DIR 时，新 best 文件只有超过历史最佳分数才会写入；历史最佳文件仍位于原目录。相同数据、参数、worker 和 world size 是复现连续训练轨迹的前提。
 
 ## 解剖 token FiLM 调制
 
-联合 Transformer 仍更新 5 个解剖 tokens。主 decoder 的三个尺度使用 FiLM 替代空间 query 对解剖 tokens 的 cross-attention：`F_out = (1 + delta_gamma) * F + beta`。2CH 选取心肌/左室腔 2 个 token，4CH 使用全部 5 个，SAX 使用心肌/左室腔/右室腔 3 个。按固定解剖顺序拼接选定 token，经 LayerNorm 和 MLP 生成每通道的缩放与偏移，广播到所有空间位置。每视图、每尺度都有独立生成器；2CH/4CH 继续共享解码卷积。
+两阶段 Transformer 更新 5 个解剖 tokens。主 decoder 的三个尺度使用 FiLM 替代空间 query 对解剖 tokens 的 cross-attention：`F_out = (1 + delta_gamma) * F + beta`。2CH 选取心肌/左室腔 2 个 token，4CH 使用全部 5 个，SAX 使用心肌/左室腔/右室腔 3 个。按固定解剖顺序拼接选定 token，经 LayerNorm 和 MLP 生成每通道的缩放与偏移，广播到所有空间位置。每视图、每尺度都有独立生成器；2CH/4CH 继续共享解码卷积。
 
-FiLM 最后一层权重和偏置零初始化，因此初始为恒等映射。主分割和深监督经调制特征输出；辅助 decoder 仍不使用解剖调制。模态掩码、patch 与 fusion token 机制保留。这是通道级全局条件调制，不保证某个 token 仅影响对应器官像素。
+FiLM 最后一层权重和偏置零初始化，因此初始为恒等映射。主分割和深监督经调制特征输出；辅助 decoder 仍不使用解剖调制。模态掩码和 patch 机制保留；fusion tokens 已移除。这是通道级全局条件调制，不保证某个 token 仅影响对应器官像素。
 
-窗口预处理缓存可继续使用，无须重新拆分。旧 cross-attention checkpoint 不支持直接测试或完整 resume，需重新训练 FiLM 模型；建议指定新的 OUTPUT_DIR 避免覆盖旧实验。
+窗口预处理缓存可继续使用，无须重新拆分。旧 fusion-token/cross-attention checkpoint 不支持直接测试或完整 resume，需重新训练 FiLM 模型；建议指定新的 OUTPUT_DIR 避免覆盖旧实验。
