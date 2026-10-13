@@ -245,6 +245,22 @@ class AnatomyFiLM(nn.Module):
         return feat * (1 + delta_gamma.reshape(shape)) + beta.reshape(shape)
 
 
+class ViewSpatialAdapter(nn.Module):
+    """Identity-initialized 2D residual adapter with depthwise/pointwise convolutions."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.depthwise = nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False)
+        self.norm = norm(channels)
+        self.activation = nn.SiLU()
+        self.pointwise = nn.Conv2d(channels, channels, 1)
+        nn.init.zeros_(self.pointwise.weight)
+        nn.init.zeros_(self.pointwise.bias)
+
+    def forward(self, feature: Tensor):
+        residual = self.pointwise(self.activation(self.norm(self.depthwise(feature))))
+        return feature + residual
+
+
 class AnatomyAwareProgressiveDecoder(nn.Module):
     def __init__(self, base: int, dim: int, view_token_counts: Mapping[str, int],
                  spatial_dims: int = 3):
@@ -256,12 +272,23 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
         self.a3 = nn.ModuleDict({v: AnatomyFiLM(base * 4, dim, n) for v, n in view_token_counts.items()})
         self.a2 = nn.ModuleDict({v: AnatomyFiLM(base * 2, dim, n) for v, n in view_token_counts.items()})
         self.a1 = nn.ModuleDict({v: AnatomyFiLM(base, dim, n) for v, n in view_token_counts.items()})
+        # LAX shares the upsampling convolutions; spatial adapters are independent.
+        self.spatial_adapters = nn.ModuleDict({
+            v: nn.ModuleList([ViewSpatialAdapter(c) for c in (base * 4, base * 2, base)])
+            for v in view_token_counts if spatial_dims == 2
+        })
 
     def forward(self, skips: Sequence[Tensor], anatomy: Tensor, availability: Tensor, view: str):
         s1, s2, s3, bottleneck = skips
         d3 = self.a3[view](self.d3(bottleneck, s3), anatomy, availability)
+        if view in self.spatial_adapters:
+            d3 = self.spatial_adapters[view][0](d3)
         d2 = self.a2[view](self.d2(d3, s2), anatomy, availability)
+        if view in self.spatial_adapters:
+            d2 = self.spatial_adapters[view][1](d2)
         d1 = self.a1[view](self.d1(d2, s1), anatomy, availability)
+        if view in self.spatial_adapters:
+            d1 = self.spatial_adapters[view][2](d1)
         return d1, d2, d3
 
 

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from models import MMFormerAnatomy
 from utils.sampling import PatientWindowSampler
+from utils.optimization import build_adamw
 from utils.checkpoint import ARCHITECTURE, atomic_save, capture_rng_state, restore_training_state
 from preprocess.processing import validate_output_sizes
 from utils import (
@@ -252,6 +253,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=2, help="DataLoader worker count")
     parser.add_argument("--resume", default=None, help="Checkpoint path to resume; --epochs is the total target epoch")
     parser.add_argument("--epochs", type=int, default=200, help="Total training epochs")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW decay for convolution/linear weights")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
@@ -344,7 +346,9 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a two-stage FiLM checkpoint without fusion tokens; older architectures are incompatible')
+            raise ValueError('Resume requires a two-stage FiLM spatial-adapter checkpoint (v4); older architectures are incompatible')
+        if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
+            raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):
             raise ValueError('Resume checkpoint source order differs from current data')
         if resume_checkpoint['num_classes_by_source'] != num_classes_by_source:
@@ -416,7 +420,7 @@ def main():
             find_unused_parameters=True,
         )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = build_adamw(get_model_core(model), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
 
     start_epoch, best_val_dice = 1, -1.0
@@ -425,6 +429,9 @@ def main():
             resume_checkpoint, get_model_core(model), optimizer, scheduler, rank, world_size)
         del resume_checkpoint
     last_ckpt = os.path.join(args.output_dir, "last_model_3d_multihead.pth")
+    if is_master_proc(rank):
+        print(f"[MultiCMR] AdamW: lr={optimizer.param_groups[0]['lr']:.8g}; "
+              f"weight_decay groups={[g['weight_decay'] for g in optimizer.param_groups]}")
     best_ckpt = os.path.join(args.output_dir, "best_model_3d_multihead.pth")
     log_path = os.path.join(args.output_dir, "train_log.txt")
 
@@ -493,6 +500,7 @@ def main():
             checkpoint = {
                 "model": get_model_core(model).state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "optimizer_type": "AdamW",
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
                 "best_val_dice": best_val_dice,

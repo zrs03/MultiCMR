@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import torch
 
-ARCHITECTURE = 'center_window_two_stage_film_v3'
+ARCHITECTURE = 'center_window_two_stage_film_adapter_v4'
 
 
 def capture_rng_state():

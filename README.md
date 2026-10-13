@@ -66,11 +66,11 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_two_stage_film_v3`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_two_stage_film_adapter_v4`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
-每轮结束后保存 `last_model_3d_multihead.pth`，验证 Dice 改善时另存 `best_model_3d_multihead.pth`。两者均包含模型、Adam、学习率调度器、已完成 epoch、历史最佳 Dice 及各 rank 的随机数状态。使用临时文件加原子替换保存，避免写入中断破坏上一次 checkpoint。
+每轮结束后保存 `last_model_3d_multihead.pth`，验证 Dice 改善时另存 `best_model_3d_multihead.pth`。两者均包含模型、AdamW、学习率调度器、已完成 epoch、历史最佳 Dice 及各 rank 的随机数状态。使用临时文件加原子替换保存，避免写入中断破坏上一次 checkpoint。
 
 ```bash
 python train.py --resume checkpoints/last_model_3d_multihead.pth --epochs 300
@@ -90,7 +90,7 @@ RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-mult
 
 FiLM 最后一层权重和偏置零初始化，因此初始为恒等映射。主分割和深监督经调制特征输出；辅助 decoder 仍不使用解剖调制。模态掩码和 patch 机制保留；fusion tokens 已移除。这是通道级全局条件调制，不保证某个 token 仅影响对应器官像素。
 
-窗口预处理缓存可继续使用，无须重新拆分。旧 fusion-token/cross-attention checkpoint 不支持直接测试或完整 resume，需重新训练 FiLM 模型；建议指定新的 OUTPUT_DIR 避免覆盖旧实验。
+窗口预处理缓存可继续使用，无须重新拆分。旧无适配层/fusion-token/cross-attention checkpoint 不支持直接测试或完整 resume，需重新训练 FiLM 模型；建议指定新的 OUTPUT_DIR 避免覆盖旧实验。
 
 ## 患者窗口采样与空间增强
 
@@ -107,4 +107,17 @@ WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
 ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
 ```
 
-Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，现有 two-stage FiLM checkpoint 可继续 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前含空间适配层的 v4 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+
+## 长轴空间适配层与 AdamW
+
+2CH/4CH 主 decoder 每级为：共享上采样/卷积 → 视图独立 FiLM → 视图独立空间残差适配层。适配层使用 `3×3 depthwise conv → GroupNorm → SiLU → 1×1 pointwise conv`，输出与输入残差相加。三个尺度各有独立参数，两个视图也不共享，共 6 个适配层；pointwise 权重和 bias 零初始化，初始严格为恒等映射。适配后的特征用于后续上采样以及主/深监督头。SAX decoder 和辅助 decoder 不新增该模块。
+
+训练使用 AdamW，默认 lr=1e-4、weight_decay=1e-4。只对卷积及线性权重（含 attention 投影）衰减；bias、归一化参数、位置/模态编码、解剖 token 与标量门控不衰减。可通过 `--weight-decay` 或 `WEIGHT_DECAY` 修改。完整 resume 恢复 checkpoint 中的 AdamW 状态和衰减值，命令行值不覆盖恢复状态。
+
+```bash
+OUTPUT_DIR=checkpoints_adapter WEIGHT_DECAY=1e-4 bash run.sh train-multi-gpu
+RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_adapter EPOCHS=300 bash run.sh train-multi-gpu
+```
+
+无需重新预处理。结构标记为 `center_window_two_stage_film_adapter_v4`；旧 v3 无适配层 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
