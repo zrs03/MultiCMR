@@ -17,7 +17,7 @@ def capture_rng_state():
     return state
 
 
-def restore_training_state(checkpoint, model, optimizer, scheduler, rank=0, world_size=1):
+def restore_training_state(checkpoint, model, optimizer, scheduler, rank=0, world_size=1, scaler=None):
     """Return next epoch and historical best; older weights support warm starts."""
     state = {k.removeprefix('module.'): v for k, v in checkpoint['model'].items()}
     model.load_state_dict(state, strict=True)
@@ -29,6 +29,11 @@ def restore_training_state(checkpoint, model, optimizer, scheduler, rank=0, worl
         return 1, -1.0
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
+    if scaler is not None and scaler.is_enabled():
+        if checkpoint.get('scaler'):
+            scaler.load_state_dict(checkpoint['scaler'])
+        elif rank == 0:
+            warnings.warn('Checkpoint has no FP16 scaler state; initializing a fresh GradScaler.', stacklevel=2)
     states = checkpoint.get('rng_states', [])
     if len(states) == world_size:
         state = states[rank]

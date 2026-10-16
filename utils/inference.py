@@ -6,13 +6,16 @@ VIEWS = ('2ch', '4ch', 'sa')
 
 
 @torch.inference_mode()
-def predict_cine(model, images, modality_mask):
+def predict_cine(model, images, modality_mask, fp16=False):
     """Slide paired LAX windows with the same SAX; average repeated probabilities.
 
     Inputs: complete native-length LAX [B,1,T,H,W], SAX [B,1,D,H,W].
     Outputs: LAX [B,T,H,W], SAX [B,D,H,W], CPU. The mask is fixed across
     all windows of a patient. SAX probabilities are averaged before argmax.
     """
+    device_type = images["sa"].device.type
+    if fp16 and device_type != "cuda":
+        raise ValueError("FP16 inference requires a CUDA device")
     if model.training:
         raise ValueError('predict_cine requires model.eval()')
     if modality_mask.shape != (images['sa'].shape[0], 3):
@@ -30,7 +33,8 @@ def predict_cine(model, images, modality_mask):
             indices = torch.as_tensor(window_indices(center[view], lengths[view], model.temporal_size),
                                       device=images[view].device)
             sample[view] = images[view].index_select(2, indices)
-        logits = model(sample, modality_mask)['logits']
+        with torch.autocast(device_type=device_type, dtype=torch.float16, enabled=fp16):
+            logits = model(sample, modality_mask)['logits']
         for i, view in enumerate(VIEWS):
             if not modality_mask[:, i].any():
                 continue

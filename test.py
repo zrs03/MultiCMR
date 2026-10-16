@@ -151,12 +151,16 @@ def main():
                     help='both: full and per-case random nonempty mask; all-seven: test all seven combinations')
     pa.add_argument('--random-repeats', type=int, default=1,
                     help='Independent random-mask draws per case (random/both modes)')
+    pa.add_argument("--fp16", action="store_true", help="Enable CUDA FP16 mixed precision inference")
     args = pa.parse_args()
     if args.random_repeats < 1:
         pa.error('--random-repeats must be >= 1')
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
+    if args.fp16 and device.type != "cuda":
+        pa.error("--fp16 requires a CUDA device")
+    print("Inference precision:", "FP16 AMP" if args.fp16 else "FP32")
 
     # Checkpoints written by the user's training script store model and metadata.
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
@@ -227,7 +231,7 @@ def main():
                 scenarios.extend((f'mask_{"".join(map(str, m))}', m) for m in all_masks)
             for scenario, mask_values in scenarios:
                 present = torch.tensor(mask_values, dtype=torch.bool, device=device).unsqueeze(0)
-                predictions = predict_cine(model, images, present)
+                predictions = predict_cine(model, images, present, fp16=args.fp16)
                 for vi, view in enumerate(order):
                     if not mask_values[vi]:
                         continue  # Never score absent-view zero placeholders.
@@ -282,6 +286,7 @@ def main():
             writer.writerows(per_case)
     (outdir/'metrics.json').write_text(json.dumps({
         'split': args.split, 'evaluation_mode': args.eval_mode,
+        'precision': 'fp16' if args.fp16 else 'fp32',
         'random_seed': args.seed, 'random_repeats': args.random_repeats,
         'output_sizes':{v:list(s) for v,s in sizes.items()},
         'lax_metrics':'mean over 2D frames', 'network_input':'centered LAX windows + shared 3D SAX',

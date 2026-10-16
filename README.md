@@ -121,3 +121,17 @@ RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_ad
 ```
 
 无需重新预处理。结构标记为 `center_window_two_stage_film_adapter_v4`；旧 v3 无适配层 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
+
+
+## 可选 FP16 混合精度
+
+默认保持 FP32。训练和测试均可通过 `--fp16` 或 `FP16=1` 启用 CUDA FP16 自动混合精度；CPU 不支持此选项，会明确报错。模型参数和优化器状态保持 FP32，前向使用 autocast，分割/边界/辅助/深度监督损失和指标使用 FP32；推理 softmax 与跨窗口概率平均也使用 FP32。
+
+```bash
+FP16=1 bash run.sh train
+FP16=1 bash run.sh train-multi-gpu
+FP16=1 bash run.sh test
+FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-multi-gpu
+```
+
+训练使用 GradScaler，溢出时跳过优化器更新并调整缩放。checkpoint 保存并在 FP16 续训时恢复 scaler 状态。旧 FP32 同架构 checkpoint 仍能续训，首次启用 FP16 会提示重新初始化 scaler；FP16 checkpoint 也可用 FP32 继续训练或推理。精度由本次命令行决定，resume 时需再次传入 `--fp16` / `FP16=1`。本次不改变网络结构或缓存格式，无需重新预处理/从头训练。实际加速及显存收益取决于 GPU 和输入尺寸，不能保证提高 Dice。

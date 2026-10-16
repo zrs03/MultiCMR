@@ -18,6 +18,11 @@ NUM_GPUS="${NUM_GPUS:-2}"
 GPU_DEVICES="${GPU_DEVICES:-0,1}"
 DEVICE="${DEVICE:-cuda:0}"
 
+precision_args=()
+if [[ "${FP16:-0}" == "1" ]]; then
+  precision_args+=(--fp16)
+fi
+
 # Omit size overrides by default so train/test respect YAML/checkpoint metadata.
 size_args=()
 if [[ -n "${LAX_SIZE:-}" ]]; then
@@ -28,7 +33,7 @@ if [[ -n "${SAX_SIZE:-}" ]]; then
   read -r -a sax_size <<< "$SAX_SIZE"
   size_args+=(--sax-size "${sax_size[@]}")
 fi
-train_args=(--split-yaml "$SPLIT_YAML" --output-dir "$OUTPUT_DIR"
+train_args=("${precision_args[@]}" --split-yaml "$SPLIT_YAML" --output-dir "$OUTPUT_DIR"
             --batch-size "$BATCH_SIZE" --num-workers "$NUM_WORKERS"
             --epochs "$EPOCHS" --lr "$LR" --weight-decay "${WEIGHT_DECAY:-1e-4}" "${size_args[@]}"
             --windows-per-patient "${WINDOWS_PER_PATIENT:-4}"
@@ -52,7 +57,7 @@ case "$MODE" in
   test)
     python test.py --split-yaml "$SPLIT_YAML" --split "${SPLIT:-val}" \
       --checkpoint "$CHECKPOINT" --output-dir "$RESULT_DIR" --device "$DEVICE" \
-      --eval-mode "${EVAL_MODE:-both}" "${size_args[@]}"
+      --eval-mode "${EVAL_MODE:-both}" "${precision_args[@]}" "${size_args[@]}"
     ;;
   eval-ef)
     # This utility requires predictions restored to the original SAX layout/spacing.
@@ -66,6 +71,7 @@ Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
   train: paired LAX windows + shared SAX; center-frame supervision
   test: sliding windows reconstruct native LAX frames; average SAX probabilities; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
+  FP16 (0=FP32 default; 1=CUDA FP16 AMP),
   WINDOWS_PER_PATIENT (default 4; 0=all), AFFINE_PROB, ROTATION_DEGREES,
   TRANSLATION_FRACTION, SCALE_FRACTION, WEIGHT_DECAY (AdamW default 1e-4),
   CHECKPOINT, DEVICE, BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, NUM_GPUS, GPU_DEVICES,

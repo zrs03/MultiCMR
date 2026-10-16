@@ -163,8 +163,12 @@ def get_model_core(model: torch.nn.Module):
 def run_one_epoch(
     model, loader, optimizer, device, source_order, num_classes_by_source,
     is_train, boundary_weight=.05, boundary_downsample=2, boundary_max_distance=10.,
-    aux_weight=.2, deep_weight=.1, is_distributed=False, world_size=1,
+    aux_weight=.2, deep_weight=.1, is_distributed=False, world_size=1, fp16=False, scaler=None,
 ):
+    if fp16 and torch.device(device).type != "cuda":
+        raise ValueError("--fp16 requires a CUDA device")
+    if is_train and fp16 and (scaler is None or not scaler.is_enabled()):
+        raise ValueError("FP16 training requires an enabled GradScaler")
     model.train(is_train)
     epoch_loss, steps = 0., 0
     # Sums and counts exclude absent views from both loss and metrics.
@@ -181,14 +185,15 @@ def run_one_epoch(
         if is_train:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(is_train):
-            outputs = model(images, modality_mask)
+            with torch.autocast(device_type=torch.device(device).type, dtype=torch.float16, enabled=fp16):
+                outputs = model(images, modality_mask)
             loss_sum, count = 0., 0
             for i, view in enumerate(source_order):
                 valid = modality_mask[:, i].bool()
                 n = int(valid.sum())
                 if not n:
                     continue
-                logits = outputs['logits'][view][valid]
+                logits = outputs['logits'][view][valid].float()
                 target = targets[view][valid]
                 classes = num_classes_by_source[view]
                 loss = dice_ce_loss_per_sample(logits, target, classes, framewise=False)
@@ -197,10 +202,10 @@ def run_one_epoch(
                         logits, target, classes, boundary_downsample, boundary_max_distance, framewise=False)
                 if is_train and aux_weight > 0:
                     loss = loss + aux_weight * dice_ce_loss_per_sample(
-                        outputs['aux_logits'][view][valid], target, classes, framewise=False)
+                        outputs['aux_logits'][view][valid].float(), target, classes, framewise=False)
                 if is_train and deep_weight > 0:
                     for pred in outputs['deep_logits'][view]:
-                        loss = loss + deep_weight * dice_ce_loss_per_sample(pred[valid], target, classes, framewise=False)
+                        loss = loss + deep_weight * dice_ce_loss_per_sample(pred[valid].float(), target, classes, framewise=False)
                 loss_sum = loss_sum + loss.sum()
                 count += n
                 with torch.no_grad():
@@ -208,8 +213,13 @@ def run_one_epoch(
                     stats[view] += torch.stack((dice * n, iou * n, logits.new_tensor(n)))
             batch_loss = loss_sum / count
             if is_train:
-                batch_loss.backward()
-                optimizer.step()
+                if fp16:
+                    scaler.scale(batch_loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    batch_loss.backward()
+                    optimizer.step()
         epoch_loss += float(batch_loss.detach())
         steps += 1
     totals = torch.tensor([epoch_loss, steps], device=device, dtype=torch.float64)
@@ -274,6 +284,7 @@ def main():
         "--boundary-max-distance", type=float, default=10.0,
         help="Clip signed distance to +/- this many voxels at loss scale.",
     )
+    parser.add_argument("--fp16", action="store_true", help="Enable CUDA FP16 automatic mixed precision")
     args = parser.parse_args()
     if args.epochs < 1:
         parser.error("--epochs must be positive")
@@ -420,16 +431,23 @@ def main():
             find_unused_parameters=True,
         )
 
+    if args.fp16 and device.type != "cuda":
+        raise ValueError("--fp16 requires a CUDA device")
+    # torch.amp.GradScaler is unavailable in older supported PyTorch 2.x releases.
+    scaler = (torch.amp.GradScaler("cuda", enabled=args.fp16)
+              if hasattr(torch.amp, "GradScaler")
+              else torch.cuda.amp.GradScaler(enabled=args.fp16))
     optimizer = build_adamw(get_model_core(model), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
 
     start_epoch, best_val_dice = 1, -1.0
     if resume_checkpoint is not None:
         start_epoch, best_val_dice = restore_training_state(
-            resume_checkpoint, get_model_core(model), optimizer, scheduler, rank, world_size)
+            resume_checkpoint, get_model_core(model), optimizer, scheduler, rank, world_size, scaler=scaler)
         del resume_checkpoint
     last_ckpt = os.path.join(args.output_dir, "last_model_3d_multihead.pth")
     if is_master_proc(rank):
+        print(f"[MultiCMR] Precision: {'FP16 AMP' if args.fp16 else 'FP32'}; losses/metrics use FP32")
         print(f"[MultiCMR] AdamW: lr={optimizer.param_groups[0]['lr']:.8g}; "
               f"weight_decay groups={[g['weight_decay'] for g in optimizer.param_groups]}")
     best_ckpt = os.path.join(args.output_dir, "best_model_3d_multihead.pth")
@@ -465,7 +483,7 @@ def main():
             boundary_downsample=args.boundary_downsample,
             boundary_max_distance=args.boundary_max_distance,
             is_distributed=is_distributed,
-            world_size=world_size,
+            world_size=world_size, fp16=args.fp16, scaler=scaler,
         )
 
         val_loss, val_stats = run_one_epoch(
@@ -480,7 +498,7 @@ def main():
             boundary_downsample=args.boundary_downsample,
             boundary_max_distance=args.boundary_max_distance,
             is_distributed=is_distributed,
-            world_size=world_size,
+            world_size=world_size, fp16=args.fp16, scaler=scaler,
         )
 
         scheduler.step(val_loss)
@@ -501,6 +519,8 @@ def main():
                 "model": get_model_core(model).state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "optimizer_type": "AdamW",
+                "scaler": scaler.state_dict(),
+                "precision": "fp16" if args.fp16 else "fp32",
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,
                 "best_val_dice": best_val_dice,
