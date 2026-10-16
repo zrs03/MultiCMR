@@ -38,9 +38,9 @@ bash run.sh train
 NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
 ```
 
-模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 转成 `[B,K,H,W]` 输入 2D encoder，亦支持直接传入后者。`temporal_size` 配置现在表示正奇数窗口长度，默认 5。两个长轴视图仍各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。辅助头、深监督头也只监督长轴中心帧。
+模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 转成 `[B*K,1,H,W]`，通过各视图内部共享的逐帧 2D encoder；亦兼容输入 `[B,K,H,W]`，会先恢复时间维。`temporal_size` 配置现在表示正奇数窗口长度，默认 5。两个长轴视图仍各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。主 decoder 和辅助 decoder 均使用中心帧 skip；只监督中心帧，不含深度监督。
 
-默认尺寸下，每个长轴窗口生成 256 个 patch tokens，SAX 为 4096 个，另有 5 个 anatomy tokens，联合序列长度为 **4613**。1×1 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，已无 fusion grid、fusion tokens 或共享三维 fusion context 支路。更新后的各视图 patches 残差注入对应 bottleneck，解剖 tokens 通过 FiLM 调制解码器。
+默认尺寸下，每个长轴窗口生成 `5×16×16=1280` 个 patch tokens，SAX 为 4096 个，另有 5 个 anatomy tokens，联合序列长度为 **6661**。1×1 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，已无 fusion grid、fusion tokens 或共享三维 fusion context 支路。长轴加入可学习时间位置编码 `[1,K,1,dim]`，token 顺序为时间优先。intra attention 在每帧空间内运行，两阶段 inter attention 处理全部帧 tokens。交互后仅取中心帧 patches 残差注入中心帧 bottleneck；SAX 保持完整三维 patches。解剖 tokens 通过 FiLM 调制解码器。
 
 跨视图 attention 分两阶段：
 
@@ -66,7 +66,7 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_film_adapter_no_deep_v6`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_framewise_2dt_v7`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
@@ -88,7 +88,7 @@ RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-mult
 
 两阶段 Transformer 更新 5 个解剖 tokens。主 decoder 的三个尺度使用 FiLM 替代空间 query 对解剖 tokens 的 cross-attention：`F_out = (1 + delta_gamma) * F + beta`。2CH 选取心肌/左室腔 2 个 token，4CH 使用全部 5 个，SAX 使用心肌/左室腔/右室腔 3 个。按固定解剖顺序拼接选定 token，经 LayerNorm 和 MLP 生成每通道的缩放与偏移，广播到所有空间位置。每视图、每尺度都有独立生成器；2CH/4CH 继续共享解码卷积。
 
-FiLM 最后一层权重和偏置零初始化，因此初始为恒等映射。主分割和深监督经调制特征输出；辅助 decoder 仍不使用解剖调制。模态掩码和 patch 机制保留；fusion tokens 已移除。这是通道级全局条件调制，不保证某个 token 仅影响对应器官像素。
+FiLM 最后一层权重和偏置零初始化，因此初始为恒等映射。主分割经调制特征输出；辅助 decoder 仍不使用解剖调制。模态掩码和 patch 机制保留；fusion tokens 已移除。这是通道级全局条件调制，不保证某个 token 仅影响对应器官像素。
 
 窗口预处理缓存可继续使用，无须重新拆分。旧无适配层/fusion-token/cross-attention checkpoint 不支持直接测试或完整 resume，需重新训练 FiLM 模型；建议指定新的 OUTPUT_DIR 避免覆盖旧实验。
 
@@ -107,11 +107,11 @@ WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
 ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
 ```
 
-Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前无深度监督的 v6 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前逐帧 2D+t 的 v7 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
 
 ## 长轴空间适配层与 AdamW
 
-2CH/4CH 主 decoder 每级为：共享上采样/卷积 → 视图独立 FiLM → 视图独立空间残差适配层。适配层使用 `3×3 depthwise conv → GroupNorm → SiLU → 1×1 pointwise conv`，输出与输入残差相加。三个尺度各有独立参数，两个视图也不共享，共 6 个适配层；pointwise 权重和 bias 零初始化，初始严格为恒等映射。适配后的特征用于后续上采样以及主/深监督头。SAX decoder 和辅助 decoder 不新增该模块。
+2CH/4CH 主 decoder 每级为：共享上采样/卷积 → 视图独立 FiLM → 视图独立空间残差适配层。适配层使用 `3×3 depthwise conv → GroupNorm → SiLU → 1×1 pointwise conv`，输出与输入残差相加。三个尺度各有独立参数，两个视图也不共享，共 6 个适配层；pointwise 权重和 bias 零初始化，初始严格为恒等映射。适配后的特征用于后续上采样以及主分割头。SAX decoder 和辅助 decoder 不新增该模块。
 
 训练使用 AdamW，默认 lr=1e-4、weight_decay=1e-4。只对卷积及线性权重（含 attention 投影）衰减；bias、归一化参数、位置/模态编码、解剖 token 与标量门控不衰减。可通过 `--weight-decay` 或 `WEIGHT_DECAY` 修改。完整 resume 恢复 checkpoint 中的 AdamW 状态和衰减值，命令行值不覆盖恢复状态。
 
@@ -120,8 +120,7 @@ OUTPUT_DIR=checkpoints_adapter WEIGHT_DECAY=1e-4 bash run.sh train-multi-gpu
 RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_adapter EPOCHS=300 bash run.sh train-multi-gpu
 ```
 
-无需重新预处理。结构标记为 `center_window_film_adapter_no_deep_v6`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
-
+无需重新预处理。结构标记为 `center_window_framewise_2dt_v7`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
 
 ## 可选 FP16 混合精度
 
@@ -136,11 +135,17 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 
 训练使用 GradScaler，溢出时跳过优化器更新并调整缩放。checkpoint 保存并在 FP16 续训时恢复 scaler 状态。旧 FP32 同架构 checkpoint 仍能续训，首次启用 FP16 会提示重新初始化 scaler；FP16 checkpoint 也可用 FP32 继续训练或推理。精度由本次命令行决定，resume 时需再次传入 `--fp16` / `FP16=1`。本次不改变网络结构或缓存格式，无需重新预处理/从头训练。实际加速及显存收益取决于 GPU 和输入尺寸，不能保证提高 Dice。
 
-
 ## 统一损失入口（无深度监督，v6）
 
 所有训练损失位于 `utils/losses.py`：`dice_ce_loss_per_sample`、`boundary_loss_per_sample`、`masked_segmentation_loss`。`train.py` 只调用组合损失并执行优化；`utils/metrics.py` 只保留评估指标；模型只负责前向。
 
 训练对每个有效样本—视图计算 `Dice + CE + 0.05 * boundary + 0.2 * auxiliary(Dice + CE)`，再对有效样本—视图数量取平均。Dice 仍包含背景，CE 无类别权重；边界仅考虑有效前景类别，默认下采样 2、距离截断 10。缺失视图不参与监督。验证不计算辅助损失。辅助 decoder 保留，与主 decoder 中间层深度监督是两回事。
 
-已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_film_adapter_no_deep_v6`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
+已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_framewise_2dt_v7`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
+
+
+## 逐帧 2D+t 时间窗（v7）
+
+长轴时间维保留至 token 阶段，每帧共享同一视图内的 2D 编码器，合并 B×K 并行编码，无逐帧 Python 循环。主输出和辅助输出仍是中心帧二维标签；模态掩码、FiLM、空间适配层、SAX 三维分支、FP16、统一损失入口不变。默认联合序列 6661 比原来的 4613 更长，计算和显存开销可能增加；这是显式时间建模，不是强制三视图 token 数完全相等。
+
+时间窗缓存不变，无需重新预处理。新增时间位置参数且首层卷积输入通道从 K 改为 1，旧 v6 及更早 checkpoint 不兼容，新版本为 `center_window_framewise_2dt_v7`。使用新的 OUTPUT_DIR 从头训练，同版本支持完整 resume。`K` 由预处理 YAML 决定，不要仅修改网络窗口长度。
