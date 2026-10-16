@@ -5,82 +5,25 @@ import time
 from typing import Dict, Tuple
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 from models import MMFormerAnatomy
 from utils.sampling import PatientWindowSampler
 from utils.optimization import build_adamw
+from utils.losses import masked_segmentation_loss
 from utils.checkpoint import ARCHITECTURE, atomic_save, capture_rng_state, restore_training_state
 from preprocess.processing import validate_output_sizes
 from utils import (
     MultiSourceNiftiDataset3D,
-    dice_ce_loss_per_sample,
     load_cases_from_yaml,
     multiclass_dice_iou,
     set_seed,
 )
 
 
-def boundary_loss_per_sample(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    num_classes: int,
-    downsample: int = 2,
-    max_distance: float = 10.0,
-    framewise: bool = False,
-) -> torch.Tensor:
-    """Signed-distance boundary loss (foreground classes only), shape [B].
-    A true GT signed distance field is computed without gradient using SciPy.
-    Output probabilities remain differentiable. Inside distances are negative.
-    Empty foreground classes are skipped; foreground classes are averaged.
-    downsample=2 computes distance maps on a half-resolution grid for speed.
-    For very thin structures, use --boundary-downsample 1.
-    """
-    if framewise:
-        batch, classes, time, height, width = logits.shape
-        frames = logits.permute(0, 2, 1, 3, 4).reshape(batch * time, classes, height, width)
-        values = boundary_loss_per_sample(frames, target.reshape(batch * time, height, width),
-                                          num_classes, downsample, max_distance)
-        return values.reshape(batch, time).mean(1)
-    if logits.ndim not in (4, 5) or target.ndim != logits.ndim - 1:
-        raise ValueError("Expected 2D/3D logits [B,C,...] and target [B,...]")
-    if logits.shape[0] != target.shape[0] or logits.shape[1] != num_classes:
-        raise ValueError("Logits/target/num_classes mismatch")
-    if downsample < 1 or max_distance <= 0:
-        raise ValueError("downsample must be >=1; max_distance must be positive")
-    if downsample > 1:
-        size = tuple(max(1, (d + downsample - 1) // downsample) for d in target.shape[1:])
-        # Resize probability maps and labels to the SAME coarse grid.
-        probs = F.interpolate(torch.softmax(logits.float(), dim=1), size=size,
-                              mode="bilinear" if logits.ndim == 4 else "trilinear", align_corners=False)
-        gt = F.interpolate(target[:, None].float(), size=size,
-                           mode="nearest")[:, 0].long()
-    else:
-        probs = torch.softmax(logits.float(), dim=1)
-        gt = target.long()
-    gt_np = gt.detach().cpu().numpy()
-    losses = []
-    for b in range(gt.shape[0]):
-        per_class = []
-        for c in range(1, num_classes):  # ignore background
-            mask = (gt_np[b] == c)
-            if not mask.any() or mask.all():
-                continue
-            inside = distance_transform_edt(mask)
-            outside = distance_transform_edt(~mask)
-            signed = np.clip(outside - inside, -max_distance, max_distance)
-            signed = np.asarray(signed / max_distance, dtype=np.float32)
-            signed_tensor = torch.from_numpy(signed).to(device=probs.device)
-            per_class.append((probs[b, c] * signed_tensor).mean())
-        # Return a graph-connected zero for samples without foreground.
-        losses.append(torch.stack(per_class).mean() if per_class
-                      else probs[b].sum() * 0.0)
-    return torch.stack(losses)
 
 def init_distributed() -> Tuple[bool, int, int, int]:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -101,13 +44,6 @@ def init_distributed() -> Tuple[bool, int, int, int]:
 
 def is_master_proc(rank: int) -> bool:
     return rank == 0
-
-
-def reduce_tensor(tensor: torch.Tensor, world_size: int) -> torch.Tensor:
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
-    rt /= world_size
-    return rt
 
 
 def parse_num_classes(config: str) -> Dict[str, int]:
@@ -163,7 +99,7 @@ def get_model_core(model: torch.nn.Module):
 def run_one_epoch(
     model, loader, optimizer, device, source_order, num_classes_by_source,
     is_train, boundary_weight=.05, boundary_downsample=2, boundary_max_distance=10.,
-    aux_weight=.2, deep_weight=.1, is_distributed=False, world_size=1, fp16=False, scaler=None,
+    aux_weight=.2, is_distributed=False, world_size=1, fp16=False, scaler=None,
 ):
     if fp16 and torch.device(device).type != "cuda":
         raise ValueError("--fp16 requires a CUDA device")
@@ -187,31 +123,19 @@ def run_one_epoch(
         with torch.set_grad_enabled(is_train):
             with torch.autocast(device_type=torch.device(device).type, dtype=torch.float16, enabled=fp16):
                 outputs = model(images, modality_mask)
-            loss_sum, count = 0., 0
-            for i, view in enumerate(source_order):
-                valid = modality_mask[:, i].bool()
-                n = int(valid.sum())
-                if not n:
-                    continue
-                logits = outputs['logits'][view][valid].float()
-                target = targets[view][valid]
-                classes = num_classes_by_source[view]
-                loss = dice_ce_loss_per_sample(logits, target, classes, framewise=False)
-                if boundary_weight > 0:
-                    loss = loss + boundary_weight * boundary_loss_per_sample(
-                        logits, target, classes, boundary_downsample, boundary_max_distance, framewise=False)
-                if is_train and aux_weight > 0:
-                    loss = loss + aux_weight * dice_ce_loss_per_sample(
-                        outputs['aux_logits'][view][valid].float(), target, classes, framewise=False)
-                if is_train and deep_weight > 0:
-                    for pred in outputs['deep_logits'][view]:
-                        loss = loss + deep_weight * dice_ce_loss_per_sample(pred[valid].float(), target, classes, framewise=False)
-                loss_sum = loss_sum + loss.sum()
-                count += n
-                with torch.no_grad():
-                    dice, iou = multiclass_dice_iou(logits, target, classes, framewise=False)
+            batch_loss = masked_segmentation_loss(
+                outputs, targets, num_classes_by_source, aux_weight=aux_weight if is_train else 0.,
+                boundary_weight=boundary_weight, boundary_downsample=boundary_downsample,
+                boundary_max_distance=boundary_max_distance)
+            with torch.no_grad():
+                for i, view in enumerate(source_order):
+                    valid = modality_mask[:, i].bool()
+                    n = int(valid.sum())
+                    if not n:
+                        continue
+                    logits = outputs['logits'][view][valid].float()
+                    dice, iou = multiclass_dice_iou(logits, targets[view][valid], num_classes_by_source[view])
                     stats[view] += torch.stack((dice * n, iou * n, logits.new_tensor(n)))
-            batch_loss = loss_sum / count
             if is_train:
                 if fp16:
                     scaler.scale(batch_loss).backward()
@@ -253,7 +177,6 @@ def main():
     parser.add_argument('--intra-layers', type=int, default=1)
     parser.add_argument('--inter-layers', type=int, default=2, help='Total layers: 1 anatomy-routed + N-1 global; minimum 2')
     parser.add_argument('--aux-weight', type=float, default=.2)
-    parser.add_argument('--deep-weight', type=float, default=.1)
     parser.add_argument('--windows-per-patient', type=int, default=4, help='Max distinct windows per patient per epoch; 0 uses all')
     parser.add_argument('--affine-prob', type=float, default=.5)
     parser.add_argument('--rotation-degrees', type=float, default=10.)
@@ -357,7 +280,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a two-stage FiLM spatial-adapter checkpoint (v4); older architectures are incompatible')
+            raise ValueError('Resume requires a no-deep-supervision checkpoint (v6); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):
@@ -478,7 +401,6 @@ def main():
             num_classes_by_source=num_classes_by_source,
             is_train=True,
             aux_weight=args.aux_weight,
-            deep_weight=args.deep_weight,
             boundary_weight=args.boundary_weight,
             boundary_downsample=args.boundary_downsample,
             boundary_max_distance=args.boundary_max_distance,

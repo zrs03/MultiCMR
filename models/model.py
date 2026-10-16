@@ -166,7 +166,7 @@ class ProgressiveDecoder(nn.Module):
         d3 = self.d3(bottleneck, s3)
         d2 = self.d2(d3, s2)
         d1 = self.d1(d2, s1)
-        return d1, d2, d3
+        return d1
 
 
 class TwoStageAnatomyTransformer(nn.Module):
@@ -289,7 +289,7 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
         d1 = self.a1[view](self.d1(d2, s1), anatomy, availability)
         if view in self.spatial_adapters:
             d1 = self.spatial_adapters[view][2](d1)
-        return d1, d2, d3
+        return d1
 
 
 class MMFormerAnatomy(nn.Module):
@@ -344,9 +344,6 @@ class MMFormerAnatomy(nn.Module):
         output_channels = dict(self.num_classes_by_source)
         self.heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
                                    for v in VIEWS})
-        self.deep_heads = nn.ModuleDict({v: nn.ModuleList([
-            (nn.Conv3d if v == 'sa' else nn.Conv2d)(base * 2, output_channels[v], 1),
-            (nn.Conv3d if v == 'sa' else nn.Conv2d)(base * 4, output_channels[v], 1)]) for v in VIEWS})
         self.aux_decoder = ProgressiveDecoder(base, dim)
         self.aux_decoder_2d = ProgressiveDecoder(base, dim, spatial_dims=2)
         self.aux_heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
@@ -354,7 +351,7 @@ class MMFormerAnatomy(nn.Module):
     def forward(self, x: Mapping[str, Tensor], modality_mask: Tensor) -> Dict:
         """LAX: [B,C,T,H,W] or [B,C*T,H,W]; SAX: [B,C,D,H,W].
 
-        LAX logits return [B,classes,H,W] for the window center, including auxiliary/deep heads.
+        LAX logits return [B,classes,H,W] for the window center, including auxiliary heads.
         The temporal length must match the configured temporal_size (default 5).
         """
         if not isinstance(x, Mapping) or set(x) != set(VIEWS):
@@ -405,7 +402,7 @@ class MMFormerAnatomy(nn.Module):
             skip_maps[view] = skips
             view_tokens[view] = tokfull + self.modality_embedding[i] * present[:, i, None, None]
         fused, anatomy_tokens = self.inter(view_tokens, present)
-        logits, aux_logits, deep_logits = {}, {}, {}
+        logits, aux_logits = {}, {}
         for i, view in enumerate(VIEWS):
             indices = present[:, i].nonzero(as_tuple=True)[0]
             nclasses = self.num_classes_by_source[view]
@@ -414,7 +411,6 @@ class MMFormerAnatomy(nn.Module):
                 logits[view] = reference.new_zeros(output_shape)
                 if self.training:
                     aux_logits[view] = reference.new_zeros(output_shape)
-                deep_logits[view] = [reference.new_zeros(output_shape) for _ in range(2)]
                 continue
             is_2d = view != 'sa'
             mode = 'bilinear' if is_2d else 'trilinear'
@@ -425,7 +421,7 @@ class MMFormerAnatomy(nn.Module):
             patch = patch.reshape(indices.numel(), self.dim, *patch_shapes[view])
             sk[-1] = sk[-1] + self.context_scale * patch
             anatomy = anatomy_tokens.index_select(0, indices)
-            d1, d2, d3 = decoder(sk, anatomy,
+            d1 = decoder(sk, anatomy,
                                   getattr(self, f'anatomy_available_{view}'), view)
 
             def restore(pred):
@@ -434,52 +430,9 @@ class MMFormerAnatomy(nn.Module):
                 return pred.new_zeros(output_shape).index_copy(0, indices, pred)
 
             logits[view] = restore(self.heads[view](d1))
-            deep_logits[view] = [restore(head(feat))
-                                 for head, feat in zip(self.deep_heads[view], (d2, d3))]
             if self.training:
-                aux1, _, _ = aux_decoder([f.index_select(0, indices) for f in skip_maps[view]])
+                aux1 = aux_decoder([f.index_select(0, indices) for f in skip_maps[view]])
                 aux_logits[view] = restore(self.aux_heads[view](aux1))
-        return dict(logits=logits, aux_logits=aux_logits, deep_logits=deep_logits,
+        return dict(logits=logits, aux_logits=aux_logits,
                     pred_tokens=fused,
                     anatomy_tokens=anatomy_tokens, valid_views=present, patch_shapes=patch_shapes)
-
-
-def masked_segmentation_loss(result: Dict, targets: Dict[str, Tensor],
-                             aux_weight: float = .2, deep_weight: float = .1) -> Tensor:
-    """Per-view segmentation CE, optional auxiliary and deep supervision."""
-    terms = []
-    for i, view in enumerate(VIEWS):
-        valid = result['valid_views'][:, i]
-        if not valid.any():
-            continue
-        target = targets[view][valid].long()
-        loss = F.cross_entropy(result['logits'][view][valid], target)
-        if view in result['aux_logits']:
-            loss = loss + aux_weight * F.cross_entropy(result['aux_logits'][view][valid], target)
-        for pred in result['deep_logits'][view]:
-            loss = loss + deep_weight * F.cross_entropy(pred[valid], target)
-        terms.append(loss)
-    if not terms:
-        raise ValueError('No valid supervised views')
-    return torch.stack(terms).mean()
-
-if __name__ == '__main__':
-    torch.manual_seed(1)
-    model = MMFormerAnatomy(base=8, dim=32, heads=4, token_grid=(2, 2, 2), temporal_size=3)
-    x = {'2ch': torch.randn(2, 1, 3, 32, 32), '4ch': torch.randn(2, 1, 3, 32, 32),
-         'sa': torch.randn(2, 1, 16, 32, 32)}
-    present = torch.tensor([[1, 0, 1], [0, 1, 0]], dtype=torch.bool)
-    result = model(x, present)
-    print('Anatomy:', tuple(result['anatomy_tokens'].shape))
-    for k, v in result['logits'].items():
-        print(k, tuple(v.shape))
-    targets = {v: torch.randint(0, c, (2, *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:])))
-               for v, c in model.num_classes_by_source.items()}
-    loss = masked_segmentation_loss(result, targets)
-    loss.backward()
-    assert torch.isfinite(loss)
-    assert model.inter.anatomy_tokens.grad is not None
-    model.eval()
-    with torch.no_grad():
-        result = model(x, present)
-    print('forward/backward/eval OK; loss =', round(loss.item(), 4))

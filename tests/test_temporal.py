@@ -11,15 +11,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from models import MMFormerAnatomy, masked_segmentation_loss
+from models import MMFormerAnatomy
+from utils.losses import masked_segmentation_loss, boundary_loss_per_sample
 from models.model import CineViewEncoder, TransformerBlock
 from preprocess.processing import DEFAULT_OUTPUT_SIZES, prepare_nifti, to_model_axes
-from train import boundary_loss_per_sample, run_one_epoch
+from train import run_one_epoch
 from utils.dataset import CaseItem, MultiSourceNiftiDataset3D, load_cases_from_yaml
 from preprocess.preprocess import main as preprocess_main
 from preprocess.processing import window_indices, paired_centers
 from utils.inference import predict_cine
-from utils.metrics import dice_ce_loss_per_sample
+from utils.losses import dice_ce_loss_per_sample
 
 VIEWS = ('2ch', '4ch', 'sa')
 CLASSES = {'2ch': 3, '4ch': 6, 'sa': 4}
@@ -210,7 +211,7 @@ class TemporalTests(unittest.TestCase):
         # A known bias per output channel checks class/time reconstruction for all heads.
         with torch.no_grad():
             for view in VIEWS[:2]:
-                for head in [model.heads[view], model.aux_heads[view], *model.deep_heads[view]]:
+                for head in [model.heads[view], model.aux_heads[view]]:
                     self.assertEqual(head.out_channels, CLASSES[view])
                     head.weight.zero_()
                     head.bias.copy_(torch.arange(head.out_channels))
@@ -219,7 +220,7 @@ class TemporalTests(unittest.TestCase):
         outputs = model(x, present)
         for view in VIEWS[:2]:
             expected = torch.arange(CLASSES[view]).reshape(CLASSES[view], 1, 1).float()
-            for pred in [outputs['logits'][view], outputs['aux_logits'][view], *outputs['deep_logits'][view]]:
+            for pred in [outputs['logits'][view], outputs['aux_logits'][view]]:
                 torch.testing.assert_close(pred[0], expected.expand(-1, 16, 24))
                 self.assertFalse(pred[1].any())
         model.eval()

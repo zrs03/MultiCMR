@@ -1,9 +1,6 @@
 from .common import set_seed, create_dir, save_json, load_json, print_and_save
 from .dataset import MultiSourceNiftiDataset3D,  load_cases_from_yaml
 from .metrics import (
-    DiceCELoss,
-    dice_ce_loss_per_sample,
-    dice_ce_loss,
     multiclass_dice_iou,
     multiclass_dice_iou_hd95,
     surface_distances,
@@ -19,8 +16,6 @@ __all__ = [
     "print_and_save",
     "MultiSourceNiftiDataset3D",
     "load_cases_from_yaml",
-    "DiceCELoss",
-    "dice_ce_loss",
     "multiclass_dice_iou",
     "multiclass_dice_iou_hd95",
     "surface_distances",

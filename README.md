@@ -66,7 +66,7 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_two_stage_film_adapter_v4`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_film_adapter_no_deep_v6`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
@@ -107,7 +107,7 @@ WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
 ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
 ```
 
-Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前含空间适配层的 v4 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前无深度监督的 v6 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
 
 ## 长轴空间适配层与 AdamW
 
@@ -120,12 +120,12 @@ OUTPUT_DIR=checkpoints_adapter WEIGHT_DECAY=1e-4 bash run.sh train-multi-gpu
 RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_adapter EPOCHS=300 bash run.sh train-multi-gpu
 ```
 
-无需重新预处理。结构标记为 `center_window_two_stage_film_adapter_v4`；旧 v3 无适配层 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
+无需重新预处理。结构标记为 `center_window_film_adapter_no_deep_v6`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
 
 
 ## 可选 FP16 混合精度
 
-默认保持 FP32。训练和测试均可通过 `--fp16` 或 `FP16=1` 启用 CUDA FP16 自动混合精度；CPU 不支持此选项，会明确报错。模型参数和优化器状态保持 FP32，前向使用 autocast，分割/边界/辅助/深度监督损失和指标使用 FP32；推理 softmax 与跨窗口概率平均也使用 FP32。
+默认保持 FP32。训练和测试均可通过 `--fp16` 或 `FP16=1` 启用 CUDA FP16 自动混合精度；CPU 不支持此选项，会明确报错。模型参数和优化器状态保持 FP32，前向使用 autocast，分割/边界/辅助损失和指标使用 FP32；推理 softmax 与跨窗口概率平均也使用 FP32。
 
 ```bash
 FP16=1 bash run.sh train
@@ -135,3 +135,12 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 ```
 
 训练使用 GradScaler，溢出时跳过优化器更新并调整缩放。checkpoint 保存并在 FP16 续训时恢复 scaler 状态。旧 FP32 同架构 checkpoint 仍能续训，首次启用 FP16 会提示重新初始化 scaler；FP16 checkpoint 也可用 FP32 继续训练或推理。精度由本次命令行决定，resume 时需再次传入 `--fp16` / `FP16=1`。本次不改变网络结构或缓存格式，无需重新预处理/从头训练。实际加速及显存收益取决于 GPU 和输入尺寸，不能保证提高 Dice。
+
+
+## 统一损失入口（无深度监督，v6）
+
+所有训练损失位于 `utils/losses.py`：`dice_ce_loss_per_sample`、`boundary_loss_per_sample`、`masked_segmentation_loss`。`train.py` 只调用组合损失并执行优化；`utils/metrics.py` 只保留评估指标；模型只负责前向。
+
+训练对每个有效样本—视图计算 `Dice + CE + 0.05 * boundary + 0.2 * auxiliary(Dice + CE)`，再对有效样本—视图数量取平均。Dice 仍包含背景，CE 无类别权重；边界仅考虑有效前景类别，默认下采样 2、距离截断 10。缺失视图不参与监督。验证不计算辅助损失。辅助 decoder 保留，与主 decoder 中间层深度监督是两回事。
+
+已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_film_adapter_no_deep_v6`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
