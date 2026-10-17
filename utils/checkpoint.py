@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import torch
 
-ARCHITECTURE = 'center_window_framewise_2dt_v7'
+ARCHITECTURE = 'center_window_lax_sax_cross_v8'
 
 
 def capture_rng_state():

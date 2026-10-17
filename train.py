@@ -175,7 +175,7 @@ def main():
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--token-grid', nargs=3, type=int, default=(2, 4, 4))
     parser.add_argument('--intra-layers', type=int, default=1)
-    parser.add_argument('--inter-layers', type=int, default=2, help='Total layers: 1 anatomy-routed + N-1 global; minimum 2')
+    parser.add_argument('--inter-layers', type=int, default=2, help='Must be 2: LAX/anatomy cross-attention, then SAX/anatomy cross-attention')
     parser.add_argument('--aux-weight', type=float, default=.2)
     parser.add_argument('--windows-per-patient', type=int, default=4, help='Max distinct windows per patient per epoch; 0 uses all')
     parser.add_argument('--affine-prob', type=float, default=.5)
@@ -280,7 +280,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a framewise 2D+t checkpoint (v7); older checkpoints have incompatible model/optimizer parameters')
+            raise ValueError('Resume requires a LAX/SAX cross-attention checkpoint (v8); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):

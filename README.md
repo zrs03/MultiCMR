@@ -40,14 +40,15 @@ NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
 
 模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 转成 `[B*K,1,H,W]`，通过各视图内部共享的逐帧 2D encoder；亦兼容输入 `[B,K,H,W]`，会先恢复时间维。`temporal_size` 配置现在表示正奇数窗口长度，默认 5。两个长轴视图仍各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。主 decoder 和辅助 decoder 均使用中心帧 skip；只监督中心帧，不含深度监督。
 
-默认尺寸下，每个长轴窗口生成 `5×16×16=1280` 个 patch tokens，SAX 为 4096 个，另有 5 个 anatomy tokens，联合序列长度为 **6661**。1×1 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，已无 fusion grid、fusion tokens 或共享三维 fusion context 支路。长轴加入可学习时间位置编码 `[1,K,1,dim]`，token 顺序为时间优先。intra attention 在每帧空间内运行，两阶段 inter attention 处理全部帧 tokens。交互后仅取中心帧 patches 残差注入中心帧 bottleneck；SAX 保持完整三维 patches。解剖 tokens 通过 FiLM 调制解码器。
+默认尺寸下，每个长轴窗口生成 `5×16×16=1280` 个 patch tokens，SAX 为 4096 个，另有 5 个 anatomy tokens，联合序列长度为 **6661**。1×1 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，已无 fusion grid、fusion tokens 或共享三维 fusion context 支路。长轴加入可学习时间位置编码 `[1,K,1,dim]`，token 顺序为时间优先。intra attention 在每帧空间内运行，两阶段 cross-attention 处理全部帧 tokens。交互后仅取中心帧 patches 残差注入中心帧 bottleneck；SAX 保持完整三维 patches。解剖 tokens 通过 FiLM 调制解码器。
 
-跨视图 attention 分两阶段：
+跨视图融合使用两个顺序 cross-attention 阶段，不再构建所有 patch 的联合 self-attention：
 
-1. **解剖关联更新**：patch queries 只能关注本视图 patches 和该视图包含的 anatomy tokens；anatomy queries 只能关注包含该结构的视图 patches 和自身。禁止跨视图 patch 直接连接、禁止不同 anatomy tokens 直接连接。左室心肌/左室腔关联三视图，右室腔关联 4CH/SAX，心房关联 4CH。这里是视图级标签先验，不用 GT 推断每个 patch 的器官类别。
-2. **全局更新**：全部可用视图 patches 和 5 个 anatomy tokens 做联合 self-attention。两阶段均屏蔽缺失视图的 keys/values，缺失视图输出不监督。
+1. **长轴阶段**：5 个解剖 token 作为 query，读取 2CH/4CH patch；2CH 仅关联心肌/左室腔，4CH 关联全部 5 个。然后长轴 patch 作为 query，读取更新后的适用解剖 token。
+2. **SAX 阶段**：心肌/左室腔/右室腔 token 读取 SAX patch，再由 SAX patch 读取更新后的这三个 token。心房 token 在本阶段保持不变。
 
-`--inter-layers` 表示两阶段总层数，默认 2、最小 2：第一阶段固定 1 层，其余层属于第二阶段。每个 anatomy token 的第一阶段 self-edge 保证其相关视图缺失时也不产生全屏蔽 attention 行。两阶段均支持 query 分块和训练 checkpoint 重算，第一阶段按块组合结构路由与模态掩码。
+`--inter-layers` 目前必须为 2，对应上述两个阶段；不再表示全局层数。每阶段两次矩形 attention，无 patch-to-patch 或 anatomy-to-anatomy self-attention。每个 cross block 使用 pre-norm、残差及 FFN。缺失视图不提供 key/value，缺失 patch 输出清零；解剖 query 没有有效图像证据时保持原值，用零 fallback 避免全屏蔽 softmax。
+
 
 训练仍均匀采样 7 种非空模态掩码；每条数据包含 SAX，但随机掩码可将它屏蔽。验证使用完整模态。缺失视图不编码、不作为 attention key/value、不计入监督。长轴 Dice+CE、边界损失及指标为中心帧二维计算；SAX 为三维计算。窗口内所有帧与中心标签采用一致的空间翻转。
 
@@ -66,7 +67,7 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_framewise_2dt_v7`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_lax_sax_cross_v8`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
@@ -107,7 +108,7 @@ WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
 ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
 ```
 
-Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前逐帧 2D+t 的 v7 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前两阶段 cross-attention 的 v8 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
 
 ## 长轴空间适配层与 AdamW
 
@@ -120,7 +121,7 @@ OUTPUT_DIR=checkpoints_adapter WEIGHT_DECAY=1e-4 bash run.sh train-multi-gpu
 RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_adapter EPOCHS=300 bash run.sh train-multi-gpu
 ```
 
-无需重新预处理。结构标记为 `center_window_framewise_2dt_v7`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
+无需重新预处理。结构标记为 `center_window_lax_sax_cross_v8`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
 
 ## 可选 FP16 混合精度
 
@@ -141,11 +142,19 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 
 训练对每个有效样本—视图计算 `Dice + CE + 0.05 * boundary + 0.2 * auxiliary(Dice + CE)`，再对有效样本—视图数量取平均。Dice 仍包含背景，CE 无类别权重；边界仅考虑有效前景类别，默认下采样 2、距离截断 10。缺失视图不参与监督。验证不计算辅助损失。辅助 decoder 保留，与主 decoder 中间层深度监督是两回事。
 
-已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_framewise_2dt_v7`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
-
+已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_lax_sax_cross_v8`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
 
 ## 逐帧 2D+t 时间窗（v7）
 
 长轴时间维保留至 token 阶段，每帧共享同一视图内的 2D 编码器，合并 B×K 并行编码，无逐帧 Python 循环。主输出和辅助输出仍是中心帧二维标签；模态掩码、FiLM、空间适配层、SAX 三维分支、FP16、统一损失入口不变。默认联合序列 6661 比原来的 4613 更长，计算和显存开销可能增加；这是显式时间建模，不是强制三视图 token 数完全相等。
 
-时间窗缓存不变，无需重新预处理。新增时间位置参数且首层卷积输入通道从 K 改为 1，旧 v6 及更早 checkpoint 不兼容，新版本为 `center_window_framewise_2dt_v7`。使用新的 OUTPUT_DIR 从头训练，同版本支持完整 resume。`K` 由预处理 YAML 决定，不要仅修改网络窗口长度。
+时间窗缓存不变，无需重新预处理。新增时间位置参数且首层卷积输入通道从 K 改为 1，旧 v6 及更早 checkpoint 不兼容，新版本为 `center_window_lax_sax_cross_v8`。使用新的 OUTPUT_DIR 从头训练，同版本支持完整 resume。`K` 由预处理 YAML 决定，不要仅修改网络窗口长度。
+
+
+## LAX → SAX 两阶段 cross-attention（v8）
+
+默认 token 数仍为 2CH 1280、4CH 1280、SAX 4096、解剖 5。融合 attention 从 N×N 改为 patch×5 / 5×patch；SAX 实际只允许其中 3 个解剖连接。只计算融合 attention 的矩阵位置，两阶段双向合计约 66560（包含被屏蔽位置，不计 fallback），原全局单层为 6661²≈4437 万；这不等于整网同倍率加速，编码器 intra self-attention、卷积、投影和 FFN 仍需计算。
+
+顺序交互具有方向性：长轴信息经解剖 token 传到 SAX；第二阶段不再次更新长轴 patch。最终解剖 token 仍通过 FiLM 调制各视图 decoder，所以 SAX 可经 FiLM 影响长轴输出。模型保持逐帧时间位置编码、中心帧解码、空间适配层、无深度监督和 FP16。
+
+参数集合变化，v8 需重新训练；旧 v7 及更早 checkpoint 不兼容。现有预处理缓存可继续使用，建议 `FP16=1 OUTPUT_DIR=checkpoints_cross bash run.sh train-multi-gpu`。同版本支持完整 resume。

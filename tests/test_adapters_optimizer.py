@@ -43,7 +43,7 @@ class AdapterOptimizerTests(unittest.TestCase):
         groups = {id(p): g['weight_decay'] for g in optimizer.param_groups for p in g['params']}
         self.assertEqual(len(groups), len(list(model.parameters())))
         self.assertEqual(groups[id(model.encoders['2ch'].c1.conv[0].weight)], .001)
-        self.assertEqual(groups[id(model.inter.routed_layer.attn.in_proj_weight)], .001)
+        self.assertEqual(groups[id(model.inter.lax_stage.anatomy_reads.attn.in_proj_weight)], .001)
         self.assertEqual(groups[id(model.inter.anatomy_tokens)], 0)
         self.assertEqual(groups[id(model.context_scale)], 0)
         self.assertEqual(groups[id(model.encoders['2ch'].token_pos)], 0)

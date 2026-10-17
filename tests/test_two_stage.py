@@ -1,4 +1,4 @@
-"""Anatomical edge restrictions, global exchange and chunked masked attention."""
+"""Sequential cross-attention routing, missing-view isolation and intra attention."""
 import unittest
 
 import torch
@@ -11,45 +11,53 @@ class TwoStageTests(unittest.TestCase):
         torch.manual_seed(21)
         self.available = torch.tensor([[1,1,0,0,0], [1,1,1,1,1], [1,1,1,0,0]], dtype=torch.bool)
 
-    def test_routing_edges(self):
-        net = TwoStageAnatomyTransformer(8, 2, self.available)
-        mask = net.routing_mask([2, 3, 4], torch.device('cpu'))
-        self.assertFalse(mask[:2, :2].any())
-        self.assertTrue(mask[:2, 2:9].all())
-        torch.testing.assert_close(mask[0, 9:], ~self.available[0])
-        torch.testing.assert_close(mask[5, 9:], ~self.available[2])
-        self.assertTrue(mask[12, :2].all())  # RA cannot read 2CH.
-        self.assertFalse(mask[12, 2:5].any())  # RA can read 4CH.
-        self.assertTrue(mask[12, 5:9].all())  # RA cannot read SAX.
-        self.assertFalse(mask[12, 12])
-        self.assertTrue(mask[12, 13])  # Different anatomy tokens only mix in stage 2.
-        self.assertFalse(mask[9, :9].any())  # Myocardium reads all views.
-
-    def test_first_stage_is_restricted_second_stage_is_global(self):
+    def test_routing_edges_and_stage_order(self):
         net = TwoStageAnatomyTransformer(8, 2, self.available, dropout=0).eval()
         tokens = {v: torch.randn(1, 2, 8) for v in ('2ch', '4ch', 'sa')}
         present = torch.ones(1, 3, dtype=torch.bool)
-        routed_outputs = []
-        hook = net.routed_layer.register_forward_hook(lambda m, a, output: routed_outputs.append(output.detach()))
-        _, first = net(tokens, present)
+        captured = []
+        hook = net.lax_stage.register_forward_hook(lambda m, a, out: captured.append((a[2], out[1])))
+        first_views, first = net(tokens, present)
         changed = {**tokens, '2ch': torch.randn_like(tokens['2ch']) * 4}
         _, second = net(changed, present)
         hook.remove()
-        # RA (anatomy index 3) sees no 2CH in the first simultaneous update.
-        torch.testing.assert_close(routed_outputs[0][:, 9], routed_outputs[1][:, 9], rtol=0, atol=0)
-        self.assertGreater((first[:, 3] - second[:, 3]).abs().max().item(), 1e-6)
-        # Missing 2CH never affects either stage, even if its inputs are NaN.
-        present[:, 0] = False
+        torch.testing.assert_close(captured[0][0][0, 0], self.available[0])
+        torch.testing.assert_close(captured[0][0][0, 2], self.available[1])
+        # RA/LA cannot read 2CH, and SAX cannot update them in stage 2.
+        torch.testing.assert_close(first[:, 3:], second[:, 3:])
+        self.assertGreater((first[:, :2] - second[:, :2]).abs().max().item(), 1e-6)
+        changed = {**tokens, 'sa': torch.randn_like(tokens['sa']) * 4}
+        other_views, other = net(changed, present)
+        # SAX is processed later: no backward patch update to LAX in this block.
+        torch.testing.assert_close(first_views['2ch'], other_views['2ch'])
+        torch.testing.assert_close(first_views['4ch'], other_views['4ch'])
+        torch.testing.assert_close(first[:, 3:], other[:, 3:])
+        self.assertGreater((first[:, :3]-other[:, :3]).abs().sum().item(), 0)
+
+    def test_all_missing_patterns_are_finite_and_isolated(self):
+        net = TwoStageAnatomyTransformer(8, 2, self.available, dropout=0).eval()
+        present = torch.tensor([[1,0,0],[0,1,0],[0,0,1],[1,1,0],[1,0,1],[0,1,1],[1,1,1]], dtype=torch.bool)
+        tokens = {v: torch.randn(7, 3, 8, requires_grad=True) for v in ('2ch','4ch','sa')}
         expected = net(tokens, present)
-        changed['2ch'].fill_(float('nan'))
-        actual = net(changed, present)
+        corrupted = {v: t.detach().masked_fill(~present[:,i,None,None], float('nan'))
+                     for i,(v,t) in enumerate(tokens.items())}
+        actual = net(corrupted, present)
         torch.testing.assert_close(expected[1], actual[1])
-        for view in tokens:
-            torch.testing.assert_close(expected[0][view], actual[0][view])
+        for v in tokens:
+            torch.testing.assert_close(expected[0][v], actual[0][v])
+        (expected[1] * torch.randn_like(expected[1])).sum().backward()
+        for i,t in enumerate(tokens.values()):
+            self.assertTrue(torch.isfinite(t.grad).all())
+            self.assertEqual(t.grad[~present[:,i]].abs().sum().item(), 0)
+        # With SAX absent, its stage leaves anatomy exactly unchanged.
+        anatomy = torch.randn(1,5,8)
+        _, unchanged = net.sax_stage(torch.zeros(1,3,8), anatomy, torch.zeros(1,3,5,dtype=torch.bool))
+        torch.testing.assert_close(unchanged, anatomy, rtol=0, atol=0)
 
     def test_chunked_routing_and_padding_match_full_attention_gradients(self):
         net = TwoStageAnatomyTransformer(8, 2, self.available)
-        routing = net.routing_mask([2, 3, 4], torch.device('cpu'))
+        routing = torch.zeros(14, 14, dtype=torch.bool)
+        routing[:, 1:3] = True
         full = TransformerBlock(8, 2, dropout=0, query_chunk_size=100)
         chunked = TransformerBlock(8, 2, dropout=0, query_chunk_size=3)
         chunked.load_state_dict(full.state_dict())

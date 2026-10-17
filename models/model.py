@@ -1,4 +1,4 @@
-"""Center-window LAX and 3D SAX with anatomy-routed then global attention.
+"""Framewise LAX and 3D SAX with sequential anatomy cross-attention.
 Five anatomy tokens condition per-view, per-scale decoder FiLM.
 Missing views are excluded from attention keys in both stages.
 """
@@ -120,8 +120,8 @@ class HybridViewEncoder(nn.Module):
 class CineViewEncoder(HybridViewEncoder):
     """Shared framewise 2D encoder; time-major tokens and center-frame skips.
 
-    B*T frames run in one batch. Intra attention is spatial per frame; routed
-    and global attention subsequently see all T*H'*W' tokens with time positions.
+    B*T frames run in one batch. Intra attention is spatial per frame; anatomy cross-attention
+    subsequently sees all T*H'*W' tokens with time positions.
     """
     def __init__(self, in_channels, base, dim, token_grid, intra_layers, heads,
                  temporal_size=5):
@@ -175,57 +175,75 @@ class ProgressiveDecoder(nn.Module):
         return d1
 
 
+class CrossAttentionBlock(nn.Module):
+    """Rectangular cross-attention with unchanged queries when no evidence exists."""
+    def __init__(self, dim, heads, dropout=.1):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(dim)
+        self.context_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.output_norm = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Dropout(dropout),
+                                 nn.Linear(4 * dim, dim), nn.Dropout(dropout))
+
+    def forward(self, query, context, allowed):
+        # allowed: [B, queries, keys]. Missing views and anatomy routing both apply.
+        has_evidence = allowed.any(-1, keepdim=True)
+        context = self.context_norm(context)
+        # A zero fallback prevents all-masked softmax; its output is discarded.
+        context = torch.cat((context, context.new_zeros(context.shape[0], 1, context.shape[-1])), 1)
+        allowed = torch.cat((allowed, ~has_evidence), -1)
+        blocked = (~allowed)[:, None].expand(-1, self.attn.num_heads, -1, -1)
+        blocked = blocked.reshape(-1, query.shape[1], context.shape[1])
+        update, _ = self.attn(self.query_norm(query), context, context,
+                              attn_mask=blocked, need_weights=False)
+        output = query + update
+        output = output + self.mlp(self.output_norm(output))
+        return torch.where(has_evidence, output, query)
+
+
+class AnatomyCrossStage(nn.Module):
+    """Anatomy gathers view evidence, then patches read the updated anatomy."""
+    def __init__(self, dim, heads, dropout=.1):
+        super().__init__()
+        self.anatomy_reads = CrossAttentionBlock(dim, heads, dropout)
+        self.patch_reads = CrossAttentionBlock(dim, heads, dropout)
+
+    def forward(self, patches, anatomy, allowed):
+        anatomy = self.anatomy_reads(anatomy, patches, allowed.transpose(1, 2))
+        patches = self.patch_reads(patches, anatomy, allowed)
+        return patches, anatomy
+
+
 class TwoStageAnatomyTransformer(nn.Module):
-    """Stage 1: view/anatomy routing. Stage 2: global available-token attention."""
+    """LAX/anatomy cross-attention followed by SAX/anatomy cross-attention."""
     def __init__(self, dim: int, heads: int, view_anatomy: Tensor, layers: int = 2,
                  dropout: float = .1):
         super().__init__()
-        if layers < 2:
-            raise ValueError('inter_layers must be >= 2: one routed layer, then global layers')
+        if layers != 2:
+            raise ValueError('inter_layers must be 2: one LAX stage, then one SAX stage')
         self.register_buffer('view_anatomy', view_anatomy.to(dtype=torch.bool).clone())
         self.anatomy_tokens = nn.Parameter(torch.randn(1, 5, dim) * .02)
-        self.routed_layer = TransformerBlock(dim, heads, dropout)
-        self.global_layers = nn.ModuleList([TransformerBlock(dim, heads, dropout) for _ in range(layers - 1)])
+        self.lax_stage = AnatomyCrossStage(dim, heads, dropout)
+        self.sax_stage = AnatomyCrossStage(dim, heads, dropout)
         self.norm = nn.LayerNorm(dim)
-
-    def routing_mask(self, lengths: Sequence[int], device):
-        """True blocks an edge. Do not infer organ membership of individual patches."""
-        total = sum(lengths)
-        blocked = torch.ones(total + 5, total + 5, device=device, dtype=torch.bool)
-        start = 0
-        for i, length in enumerate(lengths):
-            end = start + length
-            blocked[start:end, start:end] = False
-            blocked[start:end, total:] = ~self.view_anatomy[i][None, :]
-            blocked[total:, start:end] = ~self.view_anatomy[i][:, None]
-            start = end
-        # Every anatomy query has at least its own valid key, even if all
-        # views containing that anatomy are missing in this sample.
-        blocked[total:, total:] = ~torch.eye(5, device=device, dtype=torch.bool)
-        return blocked
 
     def forward(self, tokens: Mapping[str, Tensor], present: Tensor):
         batch = tokens['sa'].shape[0]
         if present.shape != (batch, 3) or not present.bool().any(dim=1).all():
             raise ValueError('Expected nonempty present mask [B,3]')
-        lengths = [tokens[v].shape[1] for v in VIEWS]
-        # Sanitize absent views before any attention (also protects against NaNs).
-        patches = [tokens[v].masked_fill(~present[:, i, None, None].bool(), 0)
+        present = present.bool()
+        patches = [tokens[v].masked_fill(~present[:, i, None, None], 0)
                    for i, v in enumerate(VIEWS)]
+        edges = [self.view_anatomy[i][None, None, :].expand(batch, p.shape[1], -1)
+                 & present[:, i, None, None] for i, p in enumerate(patches)]
         anatomy = self.anatomy_tokens.expand(batch, -1, -1)
-        x = torch.cat([*patches, anatomy], dim=1)
-        missing = torch.cat([
-            *(~present[:, i:i+1].bool().expand(-1, n) for i, n in enumerate(lengths)),
-            torch.zeros(batch, 5, device=x.device, dtype=torch.bool),
-        ], dim=1)
-        x = self.routed_layer(x, attn_mask=self.routing_mask(lengths, x.device),
-                              key_padding_mask=missing)
-        for layer in self.global_layers:
-            x = layer(x, key_padding_mask=missing)
-        chunks = self.norm(x).split([*lengths, 5], dim=1)
-        views_out = {v: chunks[i].masked_fill(~present[:, i, None, None].bool(), 0)
+        lax, anatomy = self.lax_stage(torch.cat(patches[:2], 1), anatomy, torch.cat(edges[:2], 1))
+        sax, anatomy = self.sax_stage(patches[2], anatomy, edges[2])
+        updated = (*lax.split([p.shape[1] for p in patches[:2]], dim=1), sax)
+        views_out = {v: self.norm(updated[i]).masked_fill(~present[:, i, None, None], 0)
                      for i, v in enumerate(VIEWS)}
-        return views_out, chunks[-1]
+        return views_out, self.norm(anatomy)
 
 
 class AnatomyFiLM(nn.Module):
@@ -299,7 +317,7 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
 
 
 class MMFormerAnatomy(nn.Module):
-    """Anatomy-routed/global patch attention and anatomy-conditioned FiLM."""
+    """LAX/anatomy then SAX/anatomy cross-attention and decoder FiLM."""
     def __init__(self, in_channels: int = 1,
                  num_classes_by_source: Optional[Dict[str, int]] = None,
                  source_order: Sequence[str] = VIEWS,
@@ -313,8 +331,8 @@ class MMFormerAnatomy(nn.Module):
             raise ValueError(f'source_order must be {VIEWS}')
         if dim % heads:
             raise ValueError('dim must be divisible by heads')
-        if inter_layers < 2:
-            raise ValueError('inter_layers must be >= 2 for routed and global attention')
+        if inter_layers != 2:
+            raise ValueError('inter_layers must be 2 for LAX then SAX cross-attention')
         if predict_missing:
             raise ValueError('Missing-view synthesis is not supported')
         self.num_classes_by_source = num_classes_by_source or {'2ch': 3, '4ch': 6, 'sa': 4}

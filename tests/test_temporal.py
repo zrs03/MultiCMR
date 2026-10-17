@@ -149,7 +149,7 @@ class TemporalTests(unittest.TestCase):
         loss = masked_segmentation_loss(result, y)
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
-        for p in (model.inter.routed_layer.attn.in_proj_weight, model.inter.anatomy_tokens,
+        for p in (model.inter.lax_stage.anatomy_reads.attn.in_proj_weight, model.inter.anatomy_tokens,
                   model.encoders['2ch'].c1.conv[0].weight, model.encoders['sa'].c1.conv[0].weight):
             self.assertIsNotNone(p.grad)
             self.assertTrue(torch.isfinite(p.grad).all())
