@@ -83,7 +83,7 @@ class TwoStageTests(unittest.TestCase):
             out = model(x, torch.ones(1, 3))
         self.assertNotIn('fusion_tokens', out)
         self.assertEqual(out['anatomy_tokens'].shape, (1, 5, 8))
-        self.assertEqual(sum(t.shape[1] for t in out['pred_tokens'].values()) + 5, 12)
+        self.assertEqual(sum(t.shape[1] for t in out['pred_tokens'].values()) + 5, 8)
         with self.assertRaises(ValueError):
             MMFormerAnatomy(inter_layers=1)
 

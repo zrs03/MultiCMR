@@ -142,7 +142,7 @@ class TemporalTests(unittest.TestCase):
         x = {v: torch.randn(7, 1, *((17, 25, 29) if v == 'sa' else (3, 25, 29))) for v in VIEWS}
         y = {v: torch.randint(CLASSES[v], (7, *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:]))) for v in VIEWS}
         result = model(x, present)
-        self.assertEqual(result['patch_shapes'], {'2ch': (3,2,2), '4ch': (3,2,2), 'sa': (2,2,2)})
+        self.assertEqual(result['patch_shapes'], {'2ch': (2,2), '4ch': (2,2), 'sa': (2,2,2)})
         for i,v in enumerate(VIEWS):
             self.assertEqual(result['logits'][v].shape, (7, CLASSES[v], *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:])))
             self.assertFalse(result['logits'][v][~present[:,i]].any())
@@ -186,19 +186,19 @@ class TemporalTests(unittest.TestCase):
             loss,_ = run_one_epoch(model, loader, optimizer, torch.device('cpu'), VIEWS, CLASSES, False)
             self.assertTrue(np.isfinite(loss))
 
-    def test_time_is_preserved_as_tokens(self):
+    def test_time_is_fused_as_channels(self):
         encoder = CineViewEncoder(1, 2, 8, (2, 2, 2), 1, 2, temporal_size=3).eval()
-        self.assertEqual(encoder.c1.conv[0].in_channels, 1)
-        self.assertEqual(encoder.temporal_pos.shape, (1, 3, 1, 8))
+        self.assertEqual(encoder.c1.conv[0].in_channels, 3)
+        self.assertFalse(hasattr(encoder, 'temporal_pos'))
         x = torch.randn(2, 1, 3, 16, 24)
         received = []
         hook = encoder.c1.register_forward_pre_hook(lambda module, args: received.append(args[0].clone()))
         with torch.no_grad():
             skips, tokens, shape = encoder(x)
         hook.remove()
-        torch.testing.assert_close(received[0], x.permute(0, 2, 1, 3, 4).reshape(6, 1, 16, 24))
-        self.assertEqual(shape, (3, 1, 2))
-        self.assertEqual(tokens.shape, (2, 6, 8))
+        torch.testing.assert_close(received[0], x.flatten(1, 2))
+        self.assertEqual(shape, (1, 2))
+        self.assertEqual(tokens.shape, (2, 2, 8))
         self.assertEqual(skips[0].shape, (2, 2, 16, 24))
         with torch.no_grad():
             _, direct_tokens, _ = encoder(x[:, 0])

@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import torch
 
-ARCHITECTURE = 'center_window_lax_sax_cross_patch2_v9'
+ARCHITECTURE = 'center_window_channels_cross_patch2_v10'
 
 
 def capture_rng_state():

@@ -38,9 +38,9 @@ bash run.sh train
 NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
 ```
 
-模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 转成 `[B*K,1,H,W]`，通过各视图内部共享的逐帧 2D encoder；亦兼容输入 `[B,K,H,W]`，会先恢复时间维。`temporal_size` 配置现在表示正奇数窗口长度，默认 5。两个长轴视图仍各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。主 decoder 和辅助 decoder 均使用中心帧 skip；只监督中心帧，不含深度监督。
+模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 合并为 `[B,K,H,W]`，在首层 2D 卷积融合时间窗，亦兼容直接输入 `[B,K,H,W]`。`temporal_size` 表示正奇数窗口长度，默认 5。两个长轴视图各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。主 decoder 和辅助 decoder 使用融合窗口后的二维 skips，只监督中心帧，不含深度监督。
 
-默认尺寸下，每个长轴窗口生成 `5×8×8=320` 个 patch tokens，SAX 为 512 个，另有 5 个 anatomy tokens，联合序列长度为 **1157**。kernel=2、stride=2 的空间 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，已无 fusion grid、fusion tokens 或共享三维 fusion context 支路。长轴加入可学习时间位置编码 `[1,K,1,dim]`，token 顺序为时间优先。intra attention 在每帧空间内运行，两阶段 cross-attention 处理全部帧 tokens。交互后仅取中心帧 patches 残差注入中心帧 bottleneck；SAX 保持完整三维 patches。解剖 tokens 通过 FiLM 调制解码器。
+默认尺寸下，每个长轴窗口生成 `8×8=64` 个 patch tokens，SAX 为 512 个，另有 5 个 anatomy tokens，总数为 **645**。kernel=2、stride=2 的空间 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，无 fusion tokens。时间维在首层卷积融合，不再加入时间位置编码。交互后的空间 patches 插值回 CNN 瓶颈尺寸并残差注入；解剖 tokens 通过 FiLM 调制解码器。
 
 跨视图融合使用两个顺序 cross-attention 阶段，不再构建所有 patch 的联合 self-attention：
 
@@ -66,7 +66,7 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_lax_sax_cross_patch2_v9`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_channels_cross_patch2_v10`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
@@ -107,7 +107,7 @@ WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
 ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
 ```
 
-Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前patch size=2 的 v9 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前通道时间窗、patch size=2 的 v10 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
 
 ## 长轴空间适配层与 AdamW
 
@@ -120,7 +120,7 @@ OUTPUT_DIR=checkpoints_adapter WEIGHT_DECAY=1e-4 bash run.sh train-multi-gpu
 RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_adapter EPOCHS=300 bash run.sh train-multi-gpu
 ```
 
-无需重新预处理。结构标记为 `center_window_lax_sax_cross_patch2_v9`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
+无需重新预处理。结构标记为 `center_window_channels_cross_patch2_v10`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
 
 ## 可选 FP16 混合精度
 
@@ -141,27 +141,20 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 
 训练对每个有效样本—视图计算 `Dice + CE + 0.05 * boundary + 0.2 * auxiliary(Dice + CE)`，再对有效样本—视图数量取平均。Dice 仍包含背景，CE 无类别权重；边界仅考虑有效前景类别，默认下采样 2、距离截断 10。缺失视图不参与监督。验证不计算辅助损失。辅助 decoder 保留，与主 decoder 中间层深度监督是两回事。
 
-已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_lax_sax_cross_patch2_v9`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
+已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_channels_cross_patch2_v10`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
 
-## 逐帧 2D+t 时间窗（v7）
+## 通道时间窗与两阶段交互（v10）
 
-长轴时间维保留至 token 阶段，每帧共享同一视图内的 2D 编码器，合并 B×K 并行编码，无逐帧 Python 循环。主输出和辅助输出仍是中心帧二维标签；模态掩码、FiLM、空间适配层、SAX 三维分支、FP16、统一损失入口不变。当前 patch size=2，默认 token 总数为 1157；时间维保留，不强制三视图 token 数完全相等。
+长轴默认五帧作为输入通道，在首层卷积融合；不再逐帧编码或拼接时间 tokens。窗口长度 K 仍由预处理 YAML 决定。现有五帧窗口缓存无需重新预处理，主输出和辅助输出仍为中心帧分割。
 
-时间窗缓存不变，无需重新预处理。新增时间位置参数且首层卷积输入通道从 K 改为 1，旧 v6 及更早 checkpoint 不兼容，新版本为 `center_window_lax_sax_cross_patch2_v9`。使用新的 OUTPUT_DIR 从头训练，同版本支持完整 resume。`K` 由预处理 YAML 决定，不要仅修改网络窗口长度。
+两阶段 cross-attention 保留：先由 2CH/4CH 与对应解剖 tokens 双向交互，再由 SAX 与其相连解剖 tokens 双向交互。第二阶段不再次更新长轴 patches，但最终解剖 tokens 通过 FiLM 调制所有视图 decoder。模态掩码、空间适配层、FP16、统一损失入口均不变。
 
-## LAX → SAX 两阶段 cross-attention（v8）
+默认 token 数为 2CH 64、4CH 64、SAX 512、解剖 5，总计 645。两阶段双向融合 attention 矩阵位置合计 6400（包含被屏蔽位置，不计 fallback）；这不代表整网计算量，编码器 intra self-attention、卷积和 FFN 仍需计算。
 
-当前默认 token 数为 2CH 320、4CH 320、SAX 512、解剖 5。融合 attention 从 N×N 改为 patch×5 / 5×patch；SAX 实际只允许其中 3 个解剖连接。只计算融合 attention 的矩阵位置，两阶段双向合计约 11520（包含被屏蔽位置，不计 fallback），原全局单层为 6661²≈4437 万；这不等于整网同倍率加速，编码器 intra self-attention、卷积、投影和 FFN 仍需计算。
+空间 patch size 保持 2：长轴使用 2×2、stride=2 卷积，SAX 使用 2×2×2、stride=2 卷积。奇数瓶颈尺寸在空间轴末端补零至偶数。交互后通过双线性/三线性插值恢复原瓶颈尺寸并残差融合，分割输出尺寸不变。
 
-顺序交互具有方向性：长轴信息经解剖 token 传到 SAX；第二阶段不再次更新长轴 patch。最终解剖 token 仍通过 FiLM 调制各视图 decoder，所以 SAX 可经 FiLM 影响长轴输出。模型保持逐帧时间位置编码、中心帧解码、空间适配层、无深度监督和 FP16。
+首层卷积权重形状改变，且删除时间位置参数。新架构标记为 `center_window_channels_cross_patch2_v10`，旧 checkpoint 不能直接测试或完整 resume；请使用新输出目录训练。同版本支持完整 resume。例如：
 
-patch 权重形状变化，v9 需重新训练；旧 v8 及更早 checkpoint 不兼容。现有预处理缓存可继续使用，建议 `FP16=1 OUTPUT_DIR=checkpoints_cross bash run.sh train-multi-gpu`。同版本支持完整 resume。
-
-
-## 空间 patch size=2（v9）
-
-2CH/4CH 在逐帧 2D CNN 瓶颈上使用 2×2、stride=2 卷积，SAX 使用 2×2×2、stride=2 卷积。CNN 三次下采样后继续将 token 空间网格减半，时间维 K 不变。奇数瓶颈尺寸仅在各空间轴末端补零至偶数，避免丢弃边缘，token 维度为 ceil(瓶颈尺寸/2)。
-
-交互后先取长轴中心帧，再使用双线性/三线性插值将 token 特征恢复到原 CNN 瓶颈尺寸，之后残差融合。原瓶颈、skip、分割输出尺寸不变。默认 128 尺寸下，LAX 为 K×8×8，SAX 为 8³；K=5 时总计 320+320+512+5=1157。
-
-预处理缓存无需改变；patch embedding 权重尺寸变化，旧 checkpoint 不可直接加载。新训练示例：`FP16=1 OUTPUT_DIR=checkpoints_patch2 bash run.sh train-multi-gpu`。
+```bash
+FP16=1 OUTPUT_DIR=checkpoints_window_channels bash run.sh train-multi-gpu
+```

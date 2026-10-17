@@ -182,7 +182,7 @@ def main():
         sizes['sa'] = args.sax_size
     sizes = validate_output_sizes(sizes)
     if checkpoint.get('architecture') != ARCHITECTURE:
-        raise ValueError('Checkpoint is not a LAX/SAX cross-attention patch-size-2 model (v9). Use a checkpoint trained with the current architecture.')
+        raise ValueError('Checkpoint is not a channel-window LAX/SAX cross-attention patch-size-2 model (v10). Use a checkpoint trained with the current architecture.')
     cfg = dict(checkpoint['model_config'])
     if any(sizes[v][0] != cfg['temporal_size'] for v in VIEWS[:2]):
         raise ValueError('Window size differs between checkpoint and requested preprocessing')

@@ -3,8 +3,8 @@ import torch
 from models.model import CineViewEncoder, MMFormerAnatomy
 
 
-class FramewiseCineTests(unittest.TestCase):
-    def test_default_token_count_and_center_skips(self):
+class ChannelWindowTests(unittest.TestCase):
+    def test_default_token_count_and_window_skips(self):
         encoder = CineViewEncoder(1, 2, 8, (2,4,4), 0, 2, temporal_size=5).eval()
         x = torch.randn(1,1,5,128,128)
         changed = x.clone()
@@ -12,11 +12,10 @@ class FramewiseCineTests(unittest.TestCase):
         with torch.no_grad():
             skips, tokens, shape = encoder(x)
             other_skips, other_tokens, _ = encoder(changed)
-        self.assertEqual(shape, (5,8,8))
-        self.assertEqual(tokens.shape, (1,320,8))
+        self.assertEqual(shape, (8,8))
+        self.assertEqual(tokens.shape, (1,64,8))
         for a,b in zip(skips, other_skips):
-            torch.testing.assert_close(a,b)
-        torch.testing.assert_close(tokens[:,64:], other_tokens[:,64:])
+            self.assertGreater((a-b).abs().sum().item(), 0)
         self.assertGreater((tokens[:,:64]-other_tokens[:,:64]).abs().sum().item(), 0)
 
     def test_center_output_backpropagates_to_neighbor_frames(self):
@@ -29,7 +28,7 @@ class FramewiseCineTests(unittest.TestCase):
         result['logits']['2ch'].square().mean().backward()
         for t in (0,1,2):
             self.assertGreater(images['2ch'].grad[:,:,t].abs().sum().item(), 0)
-        grad = model.encoders['2ch'].temporal_pos.grad
+        grad = model.encoders['2ch'].c1.conv[0].weight.grad
         self.assertTrue(torch.isfinite(grad).all())
         self.assertGreater(grad.abs().sum().item(), 0)
         self.assertIsNone(images['4ch'].grad)

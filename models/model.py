@@ -120,37 +120,26 @@ class HybridViewEncoder(nn.Module):
 
 
 class CineViewEncoder(HybridViewEncoder):
-    """Shared framewise 2D encoder; time-major tokens and center-frame skips.
-
-    B*T frames run in one batch. Intra attention is spatial per frame; anatomy cross-attention
-    subsequently sees all T*H'*W' tokens with time positions.
-    """
+    """Fuse the centered temporal window as channels in the first 2D convolution."""
     def __init__(self, in_channels, base, dim, token_grid, intra_layers, heads,
                  temporal_size=5):
         if not isinstance(temporal_size, int) or (temporal_size < 1 or temporal_size % 2 == 0):
             raise ValueError('temporal_size must be a positive odd integer')
-        super().__init__(in_channels, base, dim, token_grid[-2:],
+        super().__init__(in_channels * temporal_size, base, dim, token_grid[-2:],
                          intra_layers, heads, spatial_dims=2)
         self.in_channels = in_channels
         self.temporal_size = temporal_size
-        self.temporal_pos = nn.Parameter(torch.randn(1, temporal_size, 1, dim) * .02)
 
     def forward(self, x: Tensor):
-        if x.ndim == 4 and x.shape[1] == self.in_channels * self.temporal_size:
-            x = x.reshape(x.shape[0], self.in_channels, self.temporal_size, *x.shape[-2:])
         if x.ndim == 5:
             if x.shape[1:3] != (self.in_channels, self.temporal_size):
                 raise ValueError(f'Cine expects C={self.in_channels}, T={self.temporal_size}; '
                                  f'got {tuple(x.shape)}')
-        else:
+            x = x.flatten(1, 2)
+        elif x.ndim != 4 or x.shape[1] != self.in_channels * self.temporal_size:
             raise ValueError(f'Cine expects [B,{self.in_channels * self.temporal_size},H,W] '
                              'or [B,C,T,H,W]')
-        batch, channels, time, height, width = x.shape
-        frames = x.permute(0, 2, 1, 3, 4).reshape(batch * time, channels, height, width)
-        skips, tokens, spatial_shape = super().forward(frames)
-        center_skips = tuple(s.reshape(batch, time, *s.shape[1:])[:, time // 2] for s in skips)
-        tokens = tokens.reshape(batch, time, -1, tokens.shape[-1]) + self.temporal_pos
-        return center_skips, tokens.flatten(1, 2), (time, *spatial_shape)
+        return super().forward(x)
 
 
 class UpFuse(nn.Module):
@@ -413,7 +402,7 @@ class MMFormerAnatomy(nn.Module):
                 previous = shapes[-1]
                 shapes.append(tuple((n + 1) // 2 for n in previous))
             spatial_tokens = tuple((n + 1) // 2 for n in shapes[-1])
-            token_shape = spatial_tokens if view == 'sa' else (self.temporal_size, *spatial_tokens)
+            token_shape = spatial_tokens
             patch_shapes[view] = token_shape
             patches = prod(token_shape)
             indices = present[:, i].nonzero(as_tuple=True)[0]
@@ -447,8 +436,6 @@ class MMFormerAnatomy(nn.Module):
             sk = [f.index_select(0, indices) for f in skip_maps[view]]
             patch = fused[view].index_select(0, indices).transpose(1, 2)
             patch = patch.reshape(indices.numel(), self.dim, *patch_shapes[view])
-            if is_2d:
-                patch = patch[:, :, self.temporal_size // 2]
             patch = F.interpolate(patch, size=sk[-1].shape[2:], mode=mode, align_corners=False)
             sk[-1] = sk[-1] + self.context_scale * patch
             anatomy = anatomy_tokens.index_select(0, indices)
