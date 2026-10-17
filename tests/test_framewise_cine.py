@@ -12,12 +12,12 @@ class FramewiseCineTests(unittest.TestCase):
         with torch.no_grad():
             skips, tokens, shape = encoder(x)
             other_skips, other_tokens, _ = encoder(changed)
-        self.assertEqual(shape, (5,16,16))
-        self.assertEqual(tokens.shape, (1,1280,8))
+        self.assertEqual(shape, (5,8,8))
+        self.assertEqual(tokens.shape, (1,320,8))
         for a,b in zip(skips, other_skips):
             torch.testing.assert_close(a,b)
-        torch.testing.assert_close(tokens[:,256:], other_tokens[:,256:])
-        self.assertGreater((tokens[:,:256]-other_tokens[:,:256]).abs().sum().item(), 0)
+        torch.testing.assert_close(tokens[:,64:], other_tokens[:,64:])
+        self.assertGreater((tokens[:,:64]-other_tokens[:,:64]).abs().sum().item(), 0)
 
     def test_center_output_backpropagates_to_neighbor_frames(self):
         torch.manual_seed(7)

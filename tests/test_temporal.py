@@ -142,7 +142,7 @@ class TemporalTests(unittest.TestCase):
         x = {v: torch.randn(7, 1, *((17, 25, 29) if v == 'sa' else (3, 25, 29))) for v in VIEWS}
         y = {v: torch.randint(CLASSES[v], (7, *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:]))) for v in VIEWS}
         result = model(x, present)
-        self.assertEqual(result['patch_shapes'], {'2ch': (3,4,4), '4ch': (3,4,4), 'sa': (3,4,4)})
+        self.assertEqual(result['patch_shapes'], {'2ch': (3,2,2), '4ch': (3,2,2), 'sa': (2,2,2)})
         for i,v in enumerate(VIEWS):
             self.assertEqual(result['logits'][v].shape, (7, CLASSES[v], *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:])))
             self.assertFalse(result['logits'][v][~present[:,i]].any())
@@ -197,8 +197,8 @@ class TemporalTests(unittest.TestCase):
             skips, tokens, shape = encoder(x)
         hook.remove()
         torch.testing.assert_close(received[0], x.permute(0, 2, 1, 3, 4).reshape(6, 1, 16, 24))
-        self.assertEqual(shape, (3, 2, 3))
-        self.assertEqual(tokens.shape, (2, 18, 8))
+        self.assertEqual(shape, (3, 1, 2))
+        self.assertEqual(tokens.shape, (2, 6, 8))
         self.assertEqual(skips[0].shape, (2, 2, 16, 24))
         with torch.no_grad():
             _, direct_tokens, _ = encoder(x[:, 0])

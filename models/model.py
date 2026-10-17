@@ -98,7 +98,7 @@ class HybridViewEncoder(nn.Module):
         self.c2 = ConvBlock(base, base * 2, 2, spatial_dims)
         self.c3 = ConvBlock(base * 2, base * 4, 2, spatial_dims)
         self.c4 = ConvBlock(base * 4, dim, 2, spatial_dims)
-        self.patch_embed = conv(dim, dim, kernel_size=1, stride=1)
+        self.patch_embed = conv(dim, dim, kernel_size=2, stride=2)
         self.token_pos = nn.Parameter(torch.randn(1, dim, *token_grid) * .02)
         self.intra = nn.ModuleList([TransformerBlock(dim, heads) for _ in range(intra_layers)])
         self.token_norm = nn.LayerNorm(dim)
@@ -107,7 +107,9 @@ class HybridViewEncoder(nn.Module):
         s2 = self.c2(s1)
         s3 = self.c3(s2)
         b = self.c4(s3)
-        patch_map = self.patch_embed(b)
+        # Pad only the high end of odd spatial axes; retain all border features.
+        padding = tuple(value for size in reversed(b.shape[2:]) for value in (0, size % 2))
+        patch_map = self.patch_embed(F.pad(b, padding))
         token_shape = patch_map.shape[2:]
         pos = F.interpolate(self.token_pos, size=token_shape,
                             mode="bilinear" if self.spatial_dims == 2 else "trilinear", align_corners=False)
@@ -410,7 +412,8 @@ class MMFormerAnatomy(nn.Module):
             for _ in range(3):
                 previous = shapes[-1]
                 shapes.append(tuple((n + 1) // 2 for n in previous))
-            token_shape = shapes[-1] if view == 'sa' else (self.temporal_size, *shapes[-1])
+            spatial_tokens = tuple((n + 1) // 2 for n in shapes[-1])
+            token_shape = spatial_tokens if view == 'sa' else (self.temporal_size, *spatial_tokens)
             patch_shapes[view] = token_shape
             patches = prod(token_shape)
             indices = present[:, i].nonzero(as_tuple=True)[0]
@@ -446,6 +449,7 @@ class MMFormerAnatomy(nn.Module):
             patch = patch.reshape(indices.numel(), self.dim, *patch_shapes[view])
             if is_2d:
                 patch = patch[:, :, self.temporal_size // 2]
+            patch = F.interpolate(patch, size=sk[-1].shape[2:], mode=mode, align_corners=False)
             sk[-1] = sk[-1] + self.context_scale * patch
             anatomy = anatomy_tokens.index_select(0, indices)
             d1 = decoder(sk, anatomy,
