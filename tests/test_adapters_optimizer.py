@@ -29,12 +29,12 @@ class AdapterOptimizerTests(unittest.TestCase):
         self.assertEqual(set(adapters), {'2ch', '4ch'})
         self.assertEqual(len(model.decoder.spatial_adapters), 0)
         params = [m.pointwise.weight for modules in adapters.values() for m in modules]
-        self.assertEqual(len({id(p) for p in params}), 6)
+        self.assertEqual(len({id(p) for p in params}), 4)
         with torch.no_grad():
-            adapters['2ch'][2].pointwise.bias.fill_(1.)
+            adapters['2ch'][1].pointwise.bias.fill_(1.)
         x = torch.randn(1, 2, 9, 11)
-        torch.testing.assert_close(adapters['2ch'][2](x), x + 1)
-        torch.testing.assert_close(adapters['4ch'][2](x), x)
+        torch.testing.assert_close(adapters['2ch'][1](x), x + 1)
+        torch.testing.assert_close(adapters['4ch'][1](x), x)
 
     def test_adamw_groups_and_resume(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2)

@@ -1,4 +1,4 @@
-"""Framewise LAX and 3D SAX with sequential anatomy cross-attention.
+"""Channel-window LAX and 3D SAX with sequential anatomy cross-attention.
 Five anatomy tokens condition per-view, per-scale decoder FiLM.
 Missing views are excluded from attention keys in both stages.
 """
@@ -96,8 +96,7 @@ class HybridViewEncoder(nn.Module):
         conv = nn.Conv2d if spatial_dims == 2 else nn.Conv3d
         self.c1 = ConvBlock(in_channels, base, spatial_dims=spatial_dims)
         self.c2 = ConvBlock(base, base * 2, 2, spatial_dims)
-        self.c3 = ConvBlock(base * 2, base * 4, 2, spatial_dims)
-        self.c4 = ConvBlock(base * 4, dim, 2, spatial_dims)
+        self.c3 = ConvBlock(base * 2, dim, 2, spatial_dims)
         self.patch_embed = conv(dim, dim, kernel_size=2, stride=2)
         self.token_pos = nn.Parameter(torch.randn(1, dim, *token_grid) * .02)
         self.intra = nn.ModuleList([TransformerBlock(dim, heads) for _ in range(intra_layers)])
@@ -105,8 +104,7 @@ class HybridViewEncoder(nn.Module):
     def forward(self, x: Tensor):
         s1 = self.c1(x)
         s2 = self.c2(s1)
-        s3 = self.c3(s2)
-        b = self.c4(s3)
+        b = self.c3(s2)
         # Pad only the high end of odd spatial axes; retain all border features.
         padding = tuple(value for size in reversed(b.shape[2:]) for value in (0, size % 2))
         patch_map = self.patch_embed(F.pad(b, padding))
@@ -116,7 +114,7 @@ class HybridViewEncoder(nn.Module):
         tokens = patch_map.flatten(2).transpose(1, 2) + pos.flatten(2).transpose(1, 2)
         for layer in self.intra:
             tokens = layer(tokens)
-        return (s1, s2, s3, b), self.token_norm(tokens), token_shape
+        return (s1, s2, b), self.token_norm(tokens), token_shape
 
 
 class CineViewEncoder(HybridViewEncoder):
@@ -155,13 +153,11 @@ class UpFuse(nn.Module):
 class ProgressiveDecoder(nn.Module):
     def __init__(self, base: int, dim: int, spatial_dims: int = 3):
         super().__init__()
-        self.d3 = UpFuse(dim, base * 4, base * 4, spatial_dims)
-        self.d2 = UpFuse(base * 4, base * 2, base * 2, spatial_dims)
+        self.d2 = UpFuse(dim, base * 2, base * 2, spatial_dims)
         self.d1 = UpFuse(base * 2, base, base, spatial_dims)
     def forward(self, skips: Sequence[Tensor]):
-        s1, s2, s3, bottleneck = skips
-        d3 = self.d3(bottleneck, s3)
-        d2 = self.d2(d3, s2)
+        s1, s2, bottleneck = skips
+        d2 = self.d2(bottleneck, s2)
         d1 = self.d1(d2, s1)
         return d1
 
@@ -280,30 +276,25 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
     def __init__(self, base: int, dim: int, view_token_counts: Mapping[str, int],
                  spatial_dims: int = 3):
         super().__init__()
-        self.d3 = UpFuse(dim, base * 4, base * 4, spatial_dims)
-        self.d2 = UpFuse(base * 4, base * 2, base * 2, spatial_dims)
+        self.d2 = UpFuse(dim, base * 2, base * 2, spatial_dims)
         self.d1 = UpFuse(base * 2, base, base, spatial_dims)
         # Convolutions can be shared across views, but FiLM generators are not.
-        self.a3 = nn.ModuleDict({v: AnatomyFiLM(base * 4, dim, n) for v, n in view_token_counts.items()})
         self.a2 = nn.ModuleDict({v: AnatomyFiLM(base * 2, dim, n) for v, n in view_token_counts.items()})
         self.a1 = nn.ModuleDict({v: AnatomyFiLM(base, dim, n) for v, n in view_token_counts.items()})
         # LAX shares the upsampling convolutions; spatial adapters are independent.
         self.spatial_adapters = nn.ModuleDict({
-            v: nn.ModuleList([ViewSpatialAdapter(c) for c in (base * 4, base * 2, base)])
+            v: nn.ModuleList([ViewSpatialAdapter(c) for c in (base * 2, base)])
             for v in view_token_counts if spatial_dims == 2
         })
 
     def forward(self, skips: Sequence[Tensor], anatomy: Tensor, availability: Tensor, view: str):
-        s1, s2, s3, bottleneck = skips
-        d3 = self.a3[view](self.d3(bottleneck, s3), anatomy, availability)
+        s1, s2, bottleneck = skips
+        d2 = self.a2[view](self.d2(bottleneck, s2), anatomy, availability)
         if view in self.spatial_adapters:
-            d3 = self.spatial_adapters[view][0](d3)
-        d2 = self.a2[view](self.d2(d3, s2), anatomy, availability)
-        if view in self.spatial_adapters:
-            d2 = self.spatial_adapters[view][1](d2)
+            d2 = self.spatial_adapters[view][0](d2)
         d1 = self.a1[view](self.d1(d2, s1), anatomy, availability)
         if view in self.spatial_adapters:
-            d1 = self.spatial_adapters[view][2](d1)
+            d1 = self.spatial_adapters[view][1](d1)
         return d1
 
 
@@ -394,11 +385,11 @@ class MMFormerAnatomy(nn.Module):
         if not present.any(dim=1).all():
             raise ValueError('Each sample must have at least one available view')
         skip_maps, view_tokens, patch_shapes = {}, {}, {}
-        chans = (self.base, self.base * 2, self.base * 4, self.dim)
+        chans = (self.base, self.base * 2, self.dim)
         for i, view in enumerate(VIEWS):
             image = x[view]
             shapes = [tuple(image.shape[2:] if view == 'sa' else image.shape[-2:])]
-            for _ in range(3):
+            for _ in range(2):
                 previous = shapes[-1]
                 shapes.append(tuple((n + 1) // 2 for n in previous))
             spatial_tokens = tuple((n + 1) // 2 for n in shapes[-1])

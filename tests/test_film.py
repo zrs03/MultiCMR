@@ -40,14 +40,14 @@ class FiLMTests(unittest.TestCase):
     def test_generators_are_independent_per_view_and_scale(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2)
         modules = []
-        for scale in ('a1', 'a2', 'a3'):
+        for scale in ('a1', 'a2'):
             lax = getattr(model.decoder_2d, scale)
             sax = getattr(model.decoder, scale)
             self.assertEqual(lax['2ch'].num_tokens, 2)
             self.assertEqual(lax['4ch'].num_tokens, 5)
             self.assertEqual(sax['sa'].num_tokens, 3)
             modules.extend([lax['2ch'], lax['4ch'], sax['sa']])
-        self.assertEqual(len({id(m.generator[-1].weight) for m in modules}), 9)
+        self.assertEqual(len({id(m.generator[-1].weight) for m in modules}), 6)
 
 
 if __name__ == '__main__':

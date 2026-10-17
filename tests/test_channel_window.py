@@ -12,11 +12,26 @@ class ChannelWindowTests(unittest.TestCase):
         with torch.no_grad():
             skips, tokens, shape = encoder(x)
             other_skips, other_tokens, _ = encoder(changed)
-        self.assertEqual(shape, (8,8))
-        self.assertEqual(tokens.shape, (1,64,8))
+        self.assertEqual(shape, (16,16))
+        self.assertEqual(tokens.shape, (1,256,8))
         for a,b in zip(skips, other_skips):
             self.assertGreater((a-b).abs().sum().item(), 0)
-        self.assertGreater((tokens[:,:64]-other_tokens[:,:64]).abs().sum().item(), 0)
+        self.assertGreater((tokens-other_tokens).abs().sum().item(), 0)
+
+    def test_two_downsampling_and_decoder_stages(self):
+        model = MMFormerAnatomy(base=2, dim=8, heads=2)
+        for encoder in model.encoders.values():
+            self.assertFalse(hasattr(encoder, 'c4'))
+            self.assertEqual(encoder.c3.conv[0].out_channels, 8)
+        for decoder in (model.decoder, model.decoder_2d,
+                        model.aux_decoder, model.aux_decoder_2d):
+            self.assertFalse(hasattr(decoder, 'd3'))
+            self.assertFalse(hasattr(decoder, 'a3'))
+        encoder = model.encoders['2ch'].eval()
+        with torch.no_grad():
+            skips, _, _ = encoder(torch.randn(1, 1, 5, 32, 40))
+        self.assertEqual([tuple(t.shape) for t in skips],
+                         [(1, 2, 32, 40), (1, 4, 16, 20), (1, 8, 8, 10)])
 
     def test_center_output_backpropagates_to_neighbor_frames(self):
         torch.manual_seed(7)
