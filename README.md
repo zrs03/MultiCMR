@@ -158,3 +158,17 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 ```bash
 FP16=1 OUTPUT_DIR=checkpoints_window_channels bash run.sh train-multi-gpu
 ```
+
+## 训练时随机屏蔽 patch Key/Value
+
+从头训练和 resume 均默认 `--token-drop-rate 0.05`。仅当样本有至少两个存在模态时，在每个存在视图内随机选择约 5% 的 patch，禁止解剖 tokens 读取这些 patch 的 Key/Value。每视图屏蔽数量四舍五入，至少保留一个 patch；极小网格可能不屏蔽。每次训练 forward 重新抽样。
+
+全部 patch queries、CNN skips、中心帧标签、解剖 tokens 和原模态掩码保留。反向的 patch 读取解剖信息不受这个随机 mask 限制。验证/测试完全关闭随机屏蔽，无新增 loss，预处理不变。
+
+```bash
+TOKEN_DROP_RATE=0.05 FP16=1 OUTPUT_DIR=checkpoints_tokenmask bash run.sh train-multi-gpu
+# 对照：关闭随机 token 屏蔽
+TOKEN_DROP_RATE=0 FP16=1 OUTPUT_DIR=checkpoints_no_tokenmask bash run.sh train-multi-gpu
+```
+
+该选项不改变参数形状，架构版本仍为 v10。比例保存在 checkpoint 的 model_config；每次启动训练（包括 resume）均以本次参数为准，未指定时使用 0.05，不沿用 checkpoint 中的比例。显式设置 `TOKEN_DROP_RATE=0` 可关闭。resume 仍恢复原优化器和学习率调度器。

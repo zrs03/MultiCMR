@@ -200,8 +200,10 @@ class AnatomyCrossStage(nn.Module):
         self.anatomy_reads = CrossAttentionBlock(dim, heads, dropout)
         self.patch_reads = CrossAttentionBlock(dim, heads, dropout)
 
-    def forward(self, patches, anatomy, allowed):
-        anatomy = self.anatomy_reads(anatomy, patches, allowed.transpose(1, 2))
+    def forward(self, patches, anatomy, allowed, read_allowed=None):
+        # Token dropout only restricts anatomy reads, never patch queries.
+        read_allowed = allowed if read_allowed is None else read_allowed
+        anatomy = self.anatomy_reads(anatomy, patches, read_allowed.transpose(1, 2))
         patches = self.patch_reads(patches, anatomy, allowed)
         return patches, anatomy
 
@@ -209,8 +211,11 @@ class AnatomyCrossStage(nn.Module):
 class TwoStageAnatomyTransformer(nn.Module):
     """LAX/anatomy cross-attention followed by SAX/anatomy cross-attention."""
     def __init__(self, dim: int, heads: int, view_anatomy: Tensor, layers: int = 2,
-                 dropout: float = .1):
+                 dropout: float = .1, token_drop_rate: float = .05):
         super().__init__()
+        if not 0 <= token_drop_rate < 1:
+            raise ValueError("token_drop_rate must be in [0, 1)")
+        self.token_drop_rate = token_drop_rate
         if layers != 2:
             raise ValueError('inter_layers must be 2: one LAX stage, then one SAX stage')
         self.register_buffer('view_anatomy', view_anatomy.to(dtype=torch.bool).clone())
@@ -218,6 +223,25 @@ class TwoStageAnatomyTransformer(nn.Module):
         self.lax_stage = AnatomyCrossStage(dim, heads, dropout)
         self.sax_stage = AnatomyCrossStage(dim, heads, dropout)
         self.norm = nn.LayerNorm(dim)
+
+    def mask_anatomy_reads(self, edges, present):
+        if not self.training or self.token_drop_rate == 0:
+            return edges
+        eligible = present.sum(1) >= 2
+        masked = []
+        for i, allowed in enumerate(edges):
+            batch, length, _ = allowed.shape
+            # Round to the nearest token; tiny grids may have zero dropped tokens.
+            count = min(length - 1, int(length * self.token_drop_rate + .5))
+            if count == 0:
+                masked.append(allowed)
+                continue
+            keep = torch.ones(batch, length, dtype=torch.bool, device=allowed.device)
+            indices = torch.rand(batch, length, device=allowed.device).topk(count, dim=1).indices
+            keep.scatter_(1, indices, False)
+            keep |= ~(eligible & present[:, i])[:, None]
+            masked.append(allowed & keep[:, :, None])
+        return masked
 
     def forward(self, tokens: Mapping[str, Tensor], present: Tensor):
         batch = tokens['sa'].shape[0]
@@ -228,9 +252,11 @@ class TwoStageAnatomyTransformer(nn.Module):
                    for i, v in enumerate(VIEWS)]
         edges = [self.view_anatomy[i][None, None, :].expand(batch, p.shape[1], -1)
                  & present[:, i, None, None] for i, p in enumerate(patches)]
+        read_edges = self.mask_anatomy_reads(edges, present)
         anatomy = self.anatomy_tokens.expand(batch, -1, -1)
-        lax, anatomy = self.lax_stage(torch.cat(patches[:2], 1), anatomy, torch.cat(edges[:2], 1))
-        sax, anatomy = self.sax_stage(patches[2], anatomy, edges[2])
+        lax, anatomy = self.lax_stage(torch.cat(patches[:2], 1), anatomy,
+                                      torch.cat(edges[:2], 1), torch.cat(read_edges[:2], 1))
+        sax, anatomy = self.sax_stage(patches[2], anatomy, edges[2], read_edges[2])
         updated = (*lax.split([p.shape[1] for p in patches[:2]], dim=1), sax)
         views_out = {v: self.norm(updated[i]).masked_fill(~present[:, i, None, None], 0)
                      for i, v in enumerate(VIEWS)}
@@ -316,7 +342,8 @@ class MMFormerAnatomy(nn.Module):
                  token_grid: Tuple[int, int, int] = (2, 4, 4),
                  intra_layers: int = 1, inter_layers: int = 2,
                  label_to_anatomy: Optional[Mapping[str, Sequence[int]]] = None,
-                 predict_missing: bool = False, temporal_size: int = 5):
+                 predict_missing: bool = False, temporal_size: int = 5,
+                 token_drop_rate: float = .05):
         super().__init__()
         if tuple(source_order) != VIEWS:
             raise ValueError(f'source_order must be {VIEWS}')
@@ -349,7 +376,7 @@ class MMFormerAnatomy(nn.Module):
         self.modality_embedding = nn.Parameter(torch.randn(3, 1, dim) * .02)
         self.inter = TwoStageAnatomyTransformer(
             dim, heads, torch.stack([getattr(self, f'anatomy_available_{v}') for v in VIEWS]),
-            inter_layers)
+            inter_layers, token_drop_rate=token_drop_rate)
         self.context_scale = nn.Parameter(torch.tensor(.1))
         token_counts = {v: int(getattr(self, f'anatomy_available_{v}').sum()) for v in VIEWS}
         self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']})

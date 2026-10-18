@@ -175,6 +175,8 @@ def main():
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--token-grid', nargs=3, type=int, default=(2, 4, 4))
     parser.add_argument('--intra-layers', type=int, default=1)
+    parser.add_argument('--token-drop-rate', type=float, default=.05,
+                        help='Training anatomy-read token masking: default 0.05 for fresh and resumed training; 0 disables')
     parser.add_argument('--inter-layers', type=int, default=2, help='Must be 2: LAX/anatomy cross-attention, then SAX/anatomy cross-attention')
     parser.add_argument('--aux-weight', type=float, default=.2)
     parser.add_argument('--windows-per-patient', type=int, default=4, help='Max distinct windows per patient per epoch; 0 uses all')
@@ -293,7 +295,12 @@ def main():
         model_config = dict(resume_checkpoint['model_config'])
         if model_config['temporal_size'] != output_sizes['2ch'][0]:
             raise ValueError('Resume checkpoint temporal_size is inconsistent with preprocessing')
+    # Training regularization follows this invocation, including on resume.
+    model_config['token_drop_rate'] = args.token_drop_rate
+    if not 0 <= model_config['token_drop_rate'] < 1:
+        parser.error('--token-drop-rate must be in [0, 1)')
     if is_master_proc(rank):
+        print(f"[MultiCMR] Anatomy-read token masking: rate={model_config['token_drop_rate']}; train only, >=2 present views")
         print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=center-window + shared SAX')
 
     train_dataset = MultiSourceNiftiDataset3D(

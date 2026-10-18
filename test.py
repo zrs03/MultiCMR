@@ -124,7 +124,8 @@ def make_model(config, order, classes, device):
                            heads=config['heads'], token_grid=tuple(config['token_grid']),
                            intra_layers=config['intra_layers'],
                            inter_layers=config['inter_layers'],
-                           temporal_size=config['temporal_size']).to(device)
+                           temporal_size=config['temporal_size'],
+                           token_drop_rate=config.get('token_drop_rate', 0.)).to(device)
 
 
 def main():
