@@ -343,7 +343,7 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
         d1 = self.a1[view](self.d1(d2, s1), anatomy, availability)
         if view in self.spatial_adapters:
             d1 = self.spatial_adapters[view][2](d1)
-        return d1
+        return d1, d2
 
 
 class MMFormerAnatomy(nn.Module):
@@ -399,6 +399,9 @@ class MMFormerAnatomy(nn.Module):
         output_channels = dict(self.num_classes_by_source)
         self.heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
                                    for v in VIEWS})
+        self.deep_heads = nn.ModuleDict({
+            v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base * 2, output_channels[v], 1)
+            for v in VIEWS})
         self.aux_decoder = ProgressiveDecoder(base, dim)
         self.aux_decoder_2d = ProgressiveDecoder(base, dim, spatial_dims=2)
         self.aux_heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
@@ -459,7 +462,7 @@ class MMFormerAnatomy(nn.Module):
             skip_maps[view] = skips
             view_tokens[view] = tokfull + self.modality_embedding[i] * present[:, i, None, None]
         fused, anatomy_tokens = self.inter(view_tokens, present)
-        logits, aux_logits = {}, {}
+        logits, aux_logits, deep_logits = {}, {}, {}
         for i, view in enumerate(VIEWS):
             indices = present[:, i].nonzero(as_tuple=True)[0]
             nclasses = self.num_classes_by_source[view]
@@ -468,6 +471,7 @@ class MMFormerAnatomy(nn.Module):
                 logits[view] = reference.new_zeros(output_shape)
                 if self.training:
                     aux_logits[view] = reference.new_zeros(output_shape)
+                    deep_logits[view] = reference.new_zeros(output_shape)
                 continue
             is_2d = view != 'sa'
             mode = 'bilinear' if is_2d else 'trilinear'
@@ -479,7 +483,7 @@ class MMFormerAnatomy(nn.Module):
             patch = F.interpolate(patch, size=sk[-1].shape[2:], mode=mode, align_corners=False)
             sk[-1] = sk[-1] + self.context_scale * patch
             anatomy = anatomy_tokens.index_select(0, indices)
-            d1 = decoder(sk, anatomy,
+            d1, d2 = decoder(sk, anatomy,
                                   getattr(self, f'anatomy_available_{view}'), view)
 
             def restore(pred):
@@ -489,8 +493,9 @@ class MMFormerAnatomy(nn.Module):
 
             logits[view] = restore(self.heads[view](d1))
             if self.training:
+                deep_logits[view] = restore(self.deep_heads[view](d2))
                 aux1 = aux_decoder([f.index_select(0, indices) for f in skip_maps[view]])
                 aux_logits[view] = restore(self.aux_heads[view](aux1))
-        return dict(logits=logits, aux_logits=aux_logits,
+        return dict(logits=logits, aux_logits=aux_logits, deep_logits=deep_logits,
                     pred_tokens=fused,
                     anatomy_tokens=anatomy_tokens, valid_views=present, patch_shapes=patch_shapes)

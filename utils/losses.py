@@ -88,11 +88,11 @@ def boundary_loss_per_sample(
 
 def masked_segmentation_loss(result, targets, num_classes_by_source=None,
                              aux_weight=.2, boundary_weight=.05,
-                             boundary_downsample=2, boundary_max_distance=10.):
+                             boundary_downsample=2, boundary_max_distance=10., deep_weight=.1):
     """Average over present sample/view pairs; never supervise missing views.
 
     Main Dice includes background. Boundary averages nonempty foreground classes.
-    Auxiliary logits are produced only during training. No deep supervision.
+    Auxiliary and single-scale d2 logits are produced only during training.
     """
     total, count = 0., 0
     for i, view in enumerate(('2ch', '4ch', 'sa')):
@@ -111,6 +111,9 @@ def masked_segmentation_loss(result, targets, num_classes_by_source=None,
         if aux_weight > 0 and view in result.get('aux_logits', {}):
             loss = loss + aux_weight * dice_ce_loss_per_sample(
                 result['aux_logits'][view][valid].float(), target, classes)
+        if deep_weight > 0 and view in result.get('deep_logits', {}):
+            loss = loss + deep_weight * dice_ce_loss_per_sample(
+                result['deep_logits'][view][valid].float(), target, classes)
         total = total + loss.sum()
         count += n
     if count == 0:

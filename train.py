@@ -99,7 +99,7 @@ def get_model_core(model: torch.nn.Module):
 def run_one_epoch(
     model, loader, optimizer, device, source_order, num_classes_by_source,
     is_train, boundary_weight=.05, boundary_downsample=2, boundary_max_distance=10.,
-    aux_weight=.2, is_distributed=False, world_size=1, fp16=False, scaler=None,
+    aux_weight=.2, is_distributed=False, world_size=1, fp16=False, scaler=None, deep_weight=.1,
 ):
     if fp16 and torch.device(device).type != "cuda":
         raise ValueError("--fp16 requires a CUDA device")
@@ -125,6 +125,7 @@ def run_one_epoch(
                 outputs = model(images, modality_mask)
             batch_loss = masked_segmentation_loss(
                 outputs, targets, num_classes_by_source, aux_weight=aux_weight if is_train else 0.,
+                deep_weight=deep_weight if is_train else 0.,
                 boundary_weight=boundary_weight, boundary_downsample=boundary_downsample,
                 boundary_max_distance=boundary_max_distance)
             with torch.no_grad():
@@ -178,6 +179,7 @@ def main():
     parser.add_argument('--token-drop-rate', type=float, default=.05,
                         help='Training anatomy-read token masking: default 0.05 for fresh and resumed training; 0 disables')
     parser.add_argument('--inter-layers', type=int, default=2, help='Must be 2: LAX/anatomy cross-attention, then SAX/anatomy cross-attention')
+    parser.add_argument('--deep-weight', type=float, default=.1, help='Single-scale d2 Dice+CE weight; 0 disables')
     parser.add_argument('--aux-weight', type=float, default=.2)
     parser.add_argument('--windows-per-patient', type=int, default=4, help='Max distinct windows per patient per epoch; 0 uses all')
     parser.add_argument('--affine-prob', type=float, default=.5)
@@ -211,6 +213,8 @@ def main():
     )
     parser.add_argument("--fp16", action="store_true", help="Enable CUDA FP16 automatic mixed precision")
     args = parser.parse_args()
+    if not 0 <= args.deep_weight < float('inf'):
+        parser.error('--deep-weight must be finite and nonnegative')
     if args.epochs < 1:
         parser.error("--epochs must be positive")
 
@@ -282,7 +286,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a joint-LAX patch attention / SAX anatomy cross-attention patch-size-2 checkpoint (v12); older checkpoints have incompatible model/optimizer parameters')
+            raise ValueError('Resume requires a joint-LAX patch attention / SAX anatomy cross-attention patch-size-2 checkpoint (v13, single-scale deep supervision); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):
@@ -300,6 +304,7 @@ def main():
     if not 0 <= model_config['token_drop_rate'] < 1:
         parser.error('--token-drop-rate must be in [0, 1)')
     if is_master_proc(rank):
+        print(f'[MultiCMR] Single-scale d2 supervision weight: {args.deep_weight}; training only')
         print(f"[MultiCMR] Anatomy-read token masking: rate={model_config['token_drop_rate']}; train only, >=2 present views")
         print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=center-window + shared SAX')
 
@@ -407,7 +412,7 @@ def main():
             source_order=source_order,
             num_classes_by_source=num_classes_by_source,
             is_train=True,
-            aux_weight=args.aux_weight,
+            aux_weight=args.aux_weight, deep_weight=args.deep_weight,
             boundary_weight=args.boundary_weight,
             boundary_downsample=args.boundary_downsample,
             boundary_max_distance=args.boundary_max_distance,

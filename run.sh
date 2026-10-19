@@ -39,6 +39,7 @@ train_args=("${precision_args[@]}" --split-yaml "$SPLIT_YAML" --output-dir "$OUT
             --windows-per-patient "${WINDOWS_PER_PATIENT:-4}"
             --affine-prob "${AFFINE_PROB:-0.5}" --rotation-degrees "${ROTATION_DEGREES:-10}"
             --translation-fraction "${TRANSLATION_FRACTION:-0.05}" --scale-fraction "${SCALE_FRACTION:-0.1}")
+train_args+=(--deep-weight "${DEEP_WEIGHT:-0.1}")
 train_args+=(--token-drop-rate "${TOKEN_DROP_RATE:-0.05}")
 if [[ -n "${RESUME:-}" ]]; then
   train_args+=(--resume "$RESUME")
@@ -72,6 +73,7 @@ Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
   train: paired LAX windows + shared SAX; center-frame supervision
   test: sliding windows reconstruct native LAX frames; average SAX probabilities; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
+  DEEP_WEIGHT (default .1; 0 disables single-scale supervision),
   FP16 (0=FP32 default; 1=CUDA FP16 AMP), TOKEN_DROP_RATE (default .05 including resume; 0 disables),
   WINDOWS_PER_PATIENT (default 4; 0=all), AFFINE_PROB, ROTATION_DEGREES,
   TRANSLATION_FRACTION, SCALE_FRACTION, WEIGHT_DECAY (AdamW default 1e-4),

@@ -38,7 +38,7 @@ bash run.sh train
 NUM_GPUS=2 GPU_DEVICES=0,1 bash run.sh train-multi-gpu
 ```
 
-模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 合并为 `[B,K,H,W]`，在首层 2D 卷积融合时间窗，亦兼容直接输入 `[B,K,H,W]`。`temporal_size` 表示正奇数窗口长度，默认 5。两个长轴视图各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。主 decoder 和辅助 decoder 使用融合窗口后的二维 skips，只监督中心帧，不含深度监督。
+模型接收三视图字典和 `[B,3]` 模态掩码。长轴 `[B,1,K,H,W]` 合并为 `[B,K,H,W]`，在首层 2D 卷积融合时间窗，亦兼容直接输入 `[B,K,H,W]`。`temporal_size` 表示正奇数窗口长度，默认 5。两个长轴视图各自使用 encoder、共用 2D decoder、各自使用中心帧分类头；SAX 使用独立 3D 分支。主 decoder 和辅助 decoder 使用融合窗口后的二维 skips，只监督中心帧，主 decoder 的 d2 层另有单尺度深度监督。
 
 默认尺寸下，每个长轴窗口生成 `8×8=64` 个 patch tokens，SAX 为 512 个，另有 5 个 anatomy tokens，总数为 **645**。kernel=2、stride=2 的空间 patch embedding、空间位置编码、模态内 Transformer 保留；`token_grid` 仅控制 encoder 位置编码初始网格，无 fusion tokens。时间维在首层卷积融合，不再加入时间位置编码。交互后的空间 patches 插值回 CNN 瓶颈尺寸并残差注入；解剖 tokens 通过 FiLM 调制解码器。
 
@@ -66,7 +66,7 @@ test.py 读取病例级完整序列，构造与预处理一致的成对时间窗
 
 支持 full、random、both、all-seven；random 场景各视图病例子集可能不同。导出仍为模型空间 NIfTI：长轴 `[H,W,1,T_native]`，SAX `[H,W,D]`，使用单位 affine。HD95 为模型网格单位，并非毫米。`calculate_lv_ef.py` 要求原始 SAX 布局和 spacing，不能直接使用这些导出文件。
 
-尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_lax_joint_cross_patch2_v12`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
+尺寸选项为 `--lax-size K H W`、`--sax-size D H W`，启动脚本对应 `LAX_SIZE`、`SAX_SIZE`。train/test 默认从 YAML/checkpoint 读取配置，改变窗口或空间尺寸须重新预处理。新 checkpoint 标记为 `center_window_lax_joint_cross_patch2_deep_v13`。旧 64 通道整序列输出、逐帧时间 token、三路 3D 等 checkpoint 均不能用于此结构，需重新训练。
 
 ## 断点续训
 
@@ -107,7 +107,7 @@ WINDOWS_PER_PATIENT=0 AFFINE_PROB=0 bash run.sh train
 ROTATION_DEGREES=5 TRANSLATION_FRACTION=0.03 SCALE_FRACTION=0.05 bash run.sh train
 ```
 
-Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前通道时间窗、patch size=2 的 v12 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
+Python 参数对应 `--windows-per-patient`、`--affine-prob`、`--rotation-degrees`、`--translation-fraction`、`--scale-fraction`。无需重新预处理，模型结构未变化，仅当前通道时间窗、patch size=2 的 v13 checkpoint 可完整 resume；改变采样或增强后属于新的训练配置，建议另设 OUTPUT_DIR。resume 仍恢复旧学习率及调度器，不会自动重新升高学习率。
 
 ## 长轴空间适配层与 AdamW
 
@@ -120,7 +120,7 @@ OUTPUT_DIR=checkpoints_adapter WEIGHT_DECAY=1e-4 bash run.sh train-multi-gpu
 RESUME=checkpoints_adapter/last_model_3d_multihead.pth OUTPUT_DIR=checkpoints_adapter EPOCHS=300 bash run.sh train-multi-gpu
 ```
 
-无需重新预处理。结构标记为 `center_window_lax_joint_cross_patch2_v12`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
+无需重新预处理。结构标记为 `center_window_lax_joint_cross_patch2_deep_v13`；旧 v4 及更早 checkpoint 不能直接测试/完整 resume，也不会把旧 Adam 状态误载入 AdamW。请使用新的输出目录重新训练。
 
 ## 可选 FP16 混合精度
 
@@ -135,13 +135,13 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 
 训练使用 GradScaler，溢出时跳过优化器更新并调整缩放。checkpoint 保存并在 FP16 续训时恢复 scaler 状态。旧 FP32 同架构 checkpoint 仍能续训，首次启用 FP16 会提示重新初始化 scaler；FP16 checkpoint 也可用 FP32 继续训练或推理。精度由本次命令行决定，resume 时需再次传入 `--fp16` / `FP16=1`。本次不改变网络结构或缓存格式，无需重新预处理/从头训练。实际加速及显存收益取决于 GPU 和输入尺寸，不能保证提高 Dice。
 
-## 统一损失入口（无深度监督，v6）
+## 统一损失入口与单尺度深度监督（v13）
 
 所有训练损失位于 `utils/losses.py`：`dice_ce_loss_per_sample`、`boundary_loss_per_sample`、`masked_segmentation_loss`。`train.py` 只调用组合损失并执行优化；`utils/metrics.py` 只保留评估指标；模型只负责前向。
 
-训练对每个有效样本—视图计算 `Dice + CE + 0.05 * boundary + 0.2 * auxiliary(Dice + CE)`，再对有效样本—视图数量取平均。Dice 仍包含背景，CE 无类别权重；边界仅考虑有效前景类别，默认下采样 2、距离截断 10。缺失视图不参与监督。验证不计算辅助损失。辅助 decoder 保留，与主 decoder 中间层深度监督是两回事。
+训练对每个有效样本—视图计算 `Dice + CE + 0.05 * boundary + 0.2 * auxiliary(Dice + CE) + 0.1 * d2(Dice + CE)`，再对有效样本—视图数量取平均。Dice 仍包含背景，CE 无类别权重；边界仅考虑有效前景类别，默认下采样 2、距离截断 10。缺失视图不参与监督。验证不计算辅助损失和深度监督损失。辅助 decoder 保留，与主 decoder 中间层深度监督是两回事。
 
-已删除深度监督 heads、`deep_logits`、`--deep-weight`、未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数。参数集合改变，新 checkpoint 标记为 `center_window_lax_joint_cross_patch2_v12`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
+主 decoder 在 d2（默认空间尺寸 64）上使用各视图独立的 1×1 分割头，长轴为 Conv2d，SAX 为 Conv3d。中间 logits 插值回标签尺寸，使用 Dice+CE，不额外添加 boundary loss。推理不运行中间头。未使用的 CE-only 模型损失函数及 DiceCE 包装类/函数保持删除。参数集合改变，新 checkpoint 标记为 `center_window_lax_joint_cross_patch2_deep_v13`；旧 checkpoint 不能直接测试或完整 resume，请使用新输出目录训练。预处理缓存可继续使用，FP16 和同版本完整 resume 继续支持。
 
 ## 通道时间窗与两阶段交互（v12）
 
@@ -153,7 +153,7 @@ FP16=1 RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh tra
 
 空间 patch size 保持 2：长轴使用 2×2、stride=2 卷积，SAX 使用 2×2×2、stride=2 卷积。奇数瓶颈尺寸在空间轴末端补零至偶数。交互后通过双线性/三线性插值恢复原瓶颈尺寸并残差融合，分割输出尺寸不变。
 
-首层卷积权重形状改变，且删除时间位置参数。新架构标记为 `center_window_lax_joint_cross_patch2_v12`，旧 checkpoint 不能直接测试或完整 resume；请使用新输出目录训练。同版本支持完整 resume。例如：
+首层卷积权重形状改变，且删除时间位置参数。新架构标记为 `center_window_lax_joint_cross_patch2_deep_v13`，旧 checkpoint 不能直接测试或完整 resume；请使用新输出目录训练。同版本支持完整 resume。例如：
 
 ```bash
 FP16=1 OUTPUT_DIR=checkpoints_window_channels bash run.sh train-multi-gpu
@@ -171,7 +171,7 @@ TOKEN_DROP_RATE=0.05 FP16=1 OUTPUT_DIR=checkpoints_tokenmask bash run.sh train-m
 TOKEN_DROP_RATE=0 FP16=1 OUTPUT_DIR=checkpoints_no_tokenmask bash run.sh train-multi-gpu
 ```
 
-token 屏蔽选项本身不改变参数形状；当前联合长轴 attention 架构为 v12。比例保存在 checkpoint 的 model_config；每次启动训练（包括 resume）均以本次参数为准，未指定时使用 0.05，不沿用 checkpoint 中的比例。显式设置 `TOKEN_DROP_RATE=0` 可关闭。resume 仍恢复原优化器和学习率调度器。
+token 屏蔽选项本身不改变参数形状；当前联合长轴 attention 架构及单尺度深度监督版本为 v13。比例保存在 checkpoint 的 model_config；每次启动训练（包括 resume）均以本次参数为准，未指定时使用 0.05，不沿用 checkpoint 中的比例。显式设置 `TOKEN_DROP_RATE=0` 可关闭。resume 仍恢复原优化器和学习率调度器。
 
 
 ## 长轴 patches 直接交互（v12）
@@ -185,3 +185,13 @@ SAX 不加入长轴联合 self-attention，与长轴仍仅通过解剖 tokens �
 ```bash
 FP16=1 OUTPUT_DIR=checkpoints_joint_lax bash run.sh train-multi-gpu
 ```
+
+
+默认 `DEEP_WEIGHT=0.1`（Python 参数 `--deep-weight`）。直接运行 `bash run.sh train-multi-gpu` 即启用。对照实验保留相同的中间头，只把权重设为 0；固定其余配置、随机种子和训练预算：
+
+```bash
+DEEP_WEIGHT=0.1 OUTPUT_DIR=checkpoints_deep FP16=1 bash run.sh train-multi-gpu
+DEEP_WEIGHT=0 OUTPUT_DIR=checkpoints_no_deep FP16=1 bash run.sh train-multi-gpu
+```
+
+深度监督权重记录在 checkpoint 的 train_args；resume 时以本次参数为准，未指定仍默认 0.1。新增参数使 v12 及更早 checkpoint 不兼容完整恢复，需从新目录训练；预处理缓存不变。
