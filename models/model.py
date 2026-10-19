@@ -220,6 +220,7 @@ class TwoStageAnatomyTransformer(nn.Module):
             raise ValueError('inter_layers must be 2: one LAX stage, then one SAX stage')
         self.register_buffer('view_anatomy', view_anatomy.to(dtype=torch.bool).clone())
         self.anatomy_tokens = nn.Parameter(torch.randn(1, 5, dim) * .02)
+        self.lax_patch_attention = TransformerBlock(dim, heads, dropout)
         self.lax_stage = AnatomyCrossStage(dim, heads, dropout)
         self.sax_stage = AnatomyCrossStage(dim, heads, dropout)
         self.norm = nn.LayerNorm(dim)
@@ -252,9 +253,21 @@ class TwoStageAnatomyTransformer(nn.Module):
                    for i, v in enumerate(VIEWS)]
         edges = [self.view_anatomy[i][None, None, :].expand(batch, p.shape[1], -1)
                  & present[:, i, None, None] for i, p in enumerate(patches)]
+        # Joint LAX self-attention: both views can directly read each other's patches.
+        # Exclude SAX-only rows so attention never receives an all-masked key set.
+        lax = torch.cat(patches[:2], 1)
+        missing = torch.cat([~present[:, i:i+1].expand(-1, patches[i].shape[1])
+                             for i in range(2)], 1)
+        indices = present[:, :2].any(1).nonzero(as_tuple=True)[0]
+        if indices.numel():
+            updated_lax = self.lax_patch_attention(
+                lax.index_select(0, indices),
+                key_padding_mask=missing.index_select(0, indices))
+            lax = lax.index_copy(0, indices, updated_lax)
+        lax = lax.masked_fill(missing[:, :, None], 0)
         read_edges = self.mask_anatomy_reads(edges, present)
         anatomy = self.anatomy_tokens.expand(batch, -1, -1)
-        lax, anatomy = self.lax_stage(torch.cat(patches[:2], 1), anatomy,
+        lax, anatomy = self.lax_stage(lax, anatomy,
                                       torch.cat(edges[:2], 1), torch.cat(read_edges[:2], 1))
         sax, anatomy = self.sax_stage(patches[2], anatomy, edges[2], read_edges[2])
         updated = (*lax.split([p.shape[1] for p in patches[:2]], dim=1), sax)

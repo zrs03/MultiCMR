@@ -23,8 +23,8 @@ class TwoStageTests(unittest.TestCase):
         hook.remove()
         torch.testing.assert_close(captured[0][0][0, 0], self.available[0])
         torch.testing.assert_close(captured[0][0][0, 2], self.available[1])
-        # RA/LA cannot read 2CH, and SAX cannot update them in stage 2.
-        torch.testing.assert_close(first[:, 3:], second[:, 3:])
+        # RA/LA can now receive 2CH evidence indirectly through updated 4CH patches.
+        self.assertGreater((first_views['4ch'] - net(changed, present)[0]['4ch']).abs().sum().item(), 0)
         self.assertGreater((first[:, :2] - second[:, :2]).abs().max().item(), 1e-6)
         changed = {**tokens, 'sa': torch.randn_like(tokens['sa']) * 4}
         other_views, other = net(changed, present)
@@ -33,6 +33,22 @@ class TwoStageTests(unittest.TestCase):
         torch.testing.assert_close(first_views['4ch'], other_views['4ch'])
         torch.testing.assert_close(first[:, 3:], other[:, 3:])
         self.assertGreater((first[:, :3]-other[:, :3]).abs().sum().item(), 0)
+
+    def test_joint_lax_attention_is_bidirectional_and_excludes_sax(self):
+        net = TwoStageAnatomyTransformer(8, 2, self.available, dropout=0).eval()
+        tokens = {v: torch.randn(1, 4, 8) for v in ('2ch', '4ch', 'sa')}
+        captured = []
+        hook = net.lax_patch_attention.register_forward_hook(
+            lambda m, args, output: captured.append(output.detach().clone()))
+        present = torch.ones(1, 3, dtype=torch.bool)
+        net(tokens, present)
+        for view in ('2ch', '4ch', 'sa'):
+            changed = {**tokens, view: torch.randn_like(tokens[view])}
+            net(changed, present)
+        hook.remove()
+        self.assertGreater((captured[0][:,4:] - captured[1][:,4:]).abs().sum().item(), 0)
+        self.assertGreater((captured[0][:,:4] - captured[2][:,:4]).abs().sum().item(), 0)
+        torch.testing.assert_close(captured[0], captured[3])
 
     def test_all_missing_patterns_are_finite_and_isolated(self):
         net = TwoStageAnatomyTransformer(8, 2, self.available, dropout=0).eval()
