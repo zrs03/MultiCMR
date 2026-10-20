@@ -12,8 +12,8 @@ class ChannelWindowTests(unittest.TestCase):
         with torch.no_grad():
             skips, tokens, shape = encoder(x)
             other_skips, other_tokens, _ = encoder(changed)
-        self.assertEqual(shape, (8,8))
-        self.assertEqual(tokens.shape, (1,64,8))
+        self.assertEqual(shape, (16,16))
+        self.assertEqual(tokens.shape, (1,256,8))
         for a,b in zip(skips, other_skips):
             self.assertGreater((a-b).abs().sum().item(), 0)
         self.assertGreater((tokens[:,:64]-other_tokens[:,:64]).abs().sum().item(), 0)

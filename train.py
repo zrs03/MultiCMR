@@ -286,7 +286,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a joint-LAX patch attention / SAX anatomy cross-attention patch-size-2 checkpoint (v13, single-scale deep supervision); older checkpoints have incompatible model/optimizer parameters')
+            raise ValueError('Resume requires a joint-LAX patch attention / SAX anatomy cross-attention patch-size-1 checkpoint (v14, single-scale deep supervision); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):

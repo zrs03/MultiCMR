@@ -183,7 +183,7 @@ def main():
         sizes['sa'] = args.sax_size
     sizes = validate_output_sizes(sizes)
     if checkpoint.get('architecture') != ARCHITECTURE:
-        raise ValueError('Checkpoint is not a joint-LAX patch attention / SAX anatomy cross-attention patch-size-2 model (v13, single-scale deep supervision). Use a checkpoint trained with the current architecture.')
+        raise ValueError('Checkpoint is not a joint-LAX patch attention / SAX anatomy cross-attention patch-size-1 model (v14, single-scale deep supervision). Use a checkpoint trained with the current architecture.')
     cfg = dict(checkpoint['model_config'])
     if any(sizes[v][0] != cfg['temporal_size'] for v in VIEWS[:2]):
         raise ValueError('Window size differs between checkpoint and requested preprocessing')
