@@ -17,6 +17,20 @@ SOURCE_FOLDERS = {'2ch': '2CH', '4ch': '4CH', 'sa': 'SAX'}
 SPLITS = {'train': '_TR', 'val': '_VAL', 'test': '_TST'}
 
 
+PHASE_TABLES = {'train': 'sax_slice_info.json', 'val': 'id_slice_info_valid.json',
+                'test': 'sax_slice_info_test.json'}
+
+
+def resolve_phase_table(args, split):
+    """Split override > explicit common override > official file in data root."""
+    override = getattr(args, f'sax_phase_info_{split}', None) or args.sax_phase_info
+    path = Path(override) if override else Path(args.data_root) / PHASE_TABLES[split]
+    if not path.is_file():
+        raise FileNotFoundError(f'{split}: SAX phase table missing: {path.resolve()}; '
+                                f'use --sax-phase-info-{split} to override')
+    return path.resolve()
+
+
 def collect_files(root, source, suffix, kind):
     folder = root / (SOURCE_FOLDERS[source] + suffix) / kind
     result = {}
@@ -37,7 +51,7 @@ def main():
     parser.add_argument('--output-dir', default='preprocess/processed_sax_context')
     parser.add_argument('--lax-size', nargs=3, type=int, default=(5, 128, 128), metavar=('K', 'H', 'W'))
     parser.add_argument('--sax-size', nargs=3, type=int, default=(5, 128, 128), metavar=('K', 'H', 'W'))
-    parser.add_argument('--sax-phase-info', default='rawdata/id_mapping.json', help='JSON case ID -> phase count T, k=z*T+t')
+    parser.add_argument('--sax-phase-info', default=None, help='Explicit common phase-table override; default uses per-split JSON under data-root')
     for split in SPLITS:
         parser.add_argument(f'--sax-phase-info-{split}', default=None, help='Optional split-specific phase table')
     args = parser.parse_args()
@@ -53,7 +67,8 @@ def main():
         records, case_records = [], []
         phase_info = {}
         if ids:
-            path = getattr(args, f'sax_phase_info_{split}') or args.sax_phase_info
+            path = resolve_phase_table(args, split)
+            print(f'[{split}] SAX phase table: {path}', flush=True)
             with open(path) as f:
                 phase_info = {str(int(k)): v for k, v in json.load(f).items()}
         for case_id in sorted(ids, key=int):
@@ -77,7 +92,15 @@ def main():
                     if str(int(case_id)) not in phase_info:
                         raise ValueError(f'Missing SAX phase count for {split}/{case_id}; supply --sax-phase-info-{split}')
                     phases = phase_info[str(int(case_id))]
-                    slices = validate_sax_geometry(image.shape[0], phases)
+                    try:
+                        slices = validate_sax_geometry(image.shape[0], phases)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f'{split}/{case_id}: {image_path}; original_shape={shape}; '
+                            f'phase_table={path}; phases={phases}. {exc}. '
+                            'Check acquisition metadata; do not truncate frames or guess a divisor. '
+                            'Run python -m preprocess.audit_geometry to audit all cases.'
+                        ) from exc
                     arrays.update(sax_phases=np.array(phases), sax_slices=np.array(slices),
                                   flat_order=np.array('slice_phase'))
                 cached[view] = arrays

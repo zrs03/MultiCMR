@@ -46,7 +46,10 @@ if [[ -n "${RESUME:-}" ]]; then
 fi
 case "$MODE" in
   preprocess)
-    phase_args=(--sax-phase-info "${SAX_PHASE_INFO:-rawdata/id_mapping.json}")
+    phase_args=()
+    if [[ -n "${SAX_PHASE_INFO:-}" ]]; then
+      phase_args+=(--sax-phase-info "$SAX_PHASE_INFO")
+    fi
     for split in train val test; do
       key="SAX_PHASE_INFO_${split^^}"
       if [[ -n "${!key:-}" ]]; then
@@ -85,7 +88,7 @@ Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
   WINDOWS_PER_PATIENT (default 4 center-slice samples; consider 32; 0=all), AFFINE_PROB, ROTATION_DEGREES,
   TRANSLATION_FRACTION, SCALE_FRACTION, WEIGHT_DECAY (AdamW default 1e-4),
   CHECKPOINT, DEVICE, BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, NUM_GPUS, GPU_DEVICES,
-  SAX_PHASE_INFO (default rawdata/id_mapping.json), SAX_PHASE_INFO_TRAIN/VAL/TEST,
+  SAX_PHASE_INFO (optional common override; default per-split JSON in DATA_ROOT), SAX_PHASE_INFO_TRAIN/VAL/TEST,
   LAX_SIZE, SAX_SIZE (5 H W), SPLIT, EVAL_MODE, RESUME (checkpoint path; EPOCHS is total target).
 Examples:
   bash run.sh preprocess
