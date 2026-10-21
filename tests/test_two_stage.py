@@ -93,13 +93,13 @@ class TwoStageTests(unittest.TestCase):
     def test_no_fusion_parameters_or_outputs(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2, temporal_size=3).eval()
         self.assertFalse(any('fusion' in name for name, _ in model.named_parameters()))
-        x = {v: torch.randn(1, 1, 16 if v == 'sa' else 3, 16, 16)
+        x = {v: torch.randn(1, 1, 5 if v == 'sa' else 3, 16, 16)
              for v in ('2ch', '4ch', 'sa')}
         with torch.no_grad():
             out = model(x, torch.ones(1, 3))
         self.assertNotIn('fusion_tokens', out)
         self.assertEqual(out['anatomy_tokens'].shape, (1, 5, 8))
-        self.assertEqual(sum(t.shape[1] for t in out['pred_tokens'].values()) + 5, 21)
+        self.assertEqual(sum(t.shape[1] for t in out['pred_tokens'].values()) + 5, 17)
         with self.assertRaises(ValueError):
             MMFormerAnatomy(inter_layers=1)
 

@@ -117,7 +117,7 @@ def run_one_epoch(
         batch_size = images['sa'].shape[0]
         modality_mask = (sample_modality_mask(batch_size, len(source_order), device)
                          if is_train else torch.ones(batch_size, len(source_order), device=device))
-        # The model selects present samples before encoding, for both 2D and 3D inputs.
+        # The model selects present samples before encoding, for all view context inputs.
         if is_train:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(is_train):
@@ -159,9 +159,9 @@ def run_one_epoch(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train center-window LAX + 3D SAX with masked token fusion")
-    parser.add_argument("--split-yaml", type=str, default="preprocess/matched.yaml", help="Path to preprocessed split YAML")
-    parser.add_argument("--output-dir", type=str, default="checkpoints", help="Directory to save checkpoints and logs")
+    parser = argparse.ArgumentParser(description="Train center-window LAX + 2.5D SAX context with masked token fusion")
+    parser.add_argument("--split-yaml", type=str, default="preprocess/matched_sax_context.yaml", help="Path to preprocessed split YAML")
+    parser.add_argument("--output-dir", type=str, default="checkpoints_sax_context", help="Directory to save checkpoints and logs")
     parser.add_argument("--source-order", nargs="+", default=None, help="List of sequence sources (defaults to YAML or [2ch 4ch sa])")
     parser.add_argument(
         "--num-classes-json",
@@ -170,7 +170,7 @@ def main():
         help="JSON string specifying number of classes per source (defaults to YAML)",
     )
     parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH K H W (default 5 128 128 or YAML)')
-    parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX D H W (default 128 128 128 or YAML)')
+    parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX K H W (K must be 5; default 5 128 128)')
     parser.add_argument('--base', type=int, default=16)
     parser.add_argument('--dim', type=int, default=128)
     parser.add_argument('--heads', type=int, default=4)
@@ -181,7 +181,7 @@ def main():
     parser.add_argument('--inter-layers', type=int, default=2, help='Must be 2: LAX/anatomy cross-attention, then SAX/anatomy cross-attention')
     parser.add_argument('--deep-weight', type=float, default=.1, help='Single-scale d2 Dice+CE weight; 0 disables')
     parser.add_argument('--aux-weight', type=float, default=.2)
-    parser.add_argument('--windows-per-patient', type=int, default=4, help='Max distinct windows per patient per epoch; 0 uses all')
+    parser.add_argument('--windows-per-patient', type=int, default=4, help='Max paired context samples per patient per epoch (one SAX slice/phase each); 0 uses all')
     parser.add_argument('--affine-prob', type=float, default=.5)
     parser.add_argument('--rotation-degrees', type=float, default=10.)
     parser.add_argument('--translation-fraction', type=float, default=.05)
@@ -286,7 +286,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a joint-LAX patch attention / SAX anatomy cross-attention patch-size-1 checkpoint (v14, single-scale deep supervision); older checkpoints have incompatible model/optimizer parameters')
+            raise ValueError('Resume requires a SAX spatiotemporal 2.5D checkpoint (v18); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):
@@ -306,7 +306,7 @@ def main():
     if is_master_proc(rank):
         print(f'[MultiCMR] Single-scale d2 supervision weight: {args.deep_weight}; training only')
         print(f"[MultiCMR] Anatomy-read token masking: rate={model_config['token_drop_rate']}; train only, >=2 present views")
-        print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=center-window + shared SAX')
+        print(f'[MultiCMR] Per-view sizes: {output_sizes}; train/val=LAX window + SAX center slice with phase/spatial context')
 
     train_dataset = MultiSourceNiftiDataset3D(
         cases=train_cases,
@@ -390,7 +390,7 @@ def main():
 
     if is_master_proc(rank):
         with open(log_path, "a" if args.resume else "w", encoding="utf-8") as file:
-            file.write(f"Center-window LAX + 3D SAX Training Log (World size: {world_size})\n")
+            file.write(f"Center-window LAX + 2.5D SAX context Training Log (World size: {world_size})\n")
             if args.resume:
                 message = (f"Resume: {args.resume} | next_epoch={start_epoch} | "
                            f"best_val_dice={best_val_dice:.6f} | lr={optimizer.param_groups[0]['lr']:.8g}")

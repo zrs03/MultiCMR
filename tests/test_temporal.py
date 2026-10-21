@@ -1,5 +1,6 @@
 """Regression tests for time-axis handling, heterogeneous patches and masking."""
 import tempfile
+import json
 import sys
 import yaml
 import unittest
@@ -47,17 +48,17 @@ class TemporalTests(unittest.TestCase):
             np.testing.assert_array_equal(label[:, 0, 0], np.arange(5))
             self.assertEqual(shape, (7, 9, 5))
         self.assertEqual(DEFAULT_OUTPUT_SIZES['2ch'], (5, 128, 128))
-        self.assertEqual(DEFAULT_OUTPUT_SIZES['sa'], (128, 128, 128))
+        self.assertEqual(DEFAULT_OUTPUT_SIZES['sa'], (5, 128, 128))
 
     def make_case(self, directory):
-        sizes = {'2ch': (3, 16, 24), '4ch': (3, 16, 24), 'sa': (16, 16, 24)}
+        sizes = {'2ch': (3, 16, 24), '4ch': (3, 16, 24), 'sa': (5, 16, 24)}
         paths = {}
         for v, size in sizes.items():
             label = np.indices(size).sum(axis=0) % CLASSES[v]
             path = Path(directory) / f'{v}.npz'
-            np.savez_compressed(path, image=label.astype(np.float32), label=label if v == 'sa' else label[size[0] // 2],
+            np.savez_compressed(path, image=label.astype(np.float32), label=label[0 if v == 'sa' else size[0] // 2],
                                 affine=np.eye(4), original_shape=np.array((size[1], size[2], size[0])),
-                                view=np.array(v), layout=np.array('DHW' if v == 'sa' else 'KHW'))
+                                view=np.array(v), layout=np.array('KHW'), sax_phases=np.array(4))
             paths[v] = str(path)
         return CaseItem('001', paths, paths), sizes
 
@@ -69,10 +70,10 @@ class TemporalTests(unittest.TestCase):
             for _ in range(4):
                 item = dataset[0]
                 for v in VIEWS:
-                    torch.testing.assert_close(item['image'][v][0] if v == 'sa' else item['image'][v][0, sizes[v][0] // 2], item['masks'][v].float())
+                    torch.testing.assert_close(item['image'][v][0, 0] if v == 'sa' else item['image'][v][0, sizes[v][0] // 2], item['masks'][v].float())
             batch = next(iter(DataLoader(dataset, batch_size=1)))
             self.assertEqual(batch['image']['2ch'].shape, (1, 1, 3, 16, 24))
-            self.assertEqual(batch['image']['sa'].shape, (1, 1, 16, 16, 24))
+            self.assertEqual(batch['image']['sa'].shape, (1, 1, 5, 16, 24))
             # Spatial flips applied to an entire cine never reorder its frames.
             with patch('numpy.random.rand', return_value=0.):
                 augmented = MultiSourceNiftiDataset3D([case], sizes, augment=True, affine_prob=0)[0]
@@ -93,24 +94,26 @@ class TemporalTests(unittest.TestCase):
                             array %= CLASSES['sa' if view == 'SAX' else view.lower()]
                         nib.save(nib.Nifti1Image(array.astype(np.float32), np.eye(4)),
                                  dest / f'CINE_{view}_001.nii.gz')
+            phase_info = root / 'phases.json'
+            phase_info.write_text(json.dumps({'001': 4}))
             manifest = root / 'matched.yaml'
             args = ['preprocess', '--data-root', str(root / 'raw'), '--output-yaml', str(manifest),
                     '--output-dir', str(root / 'cache'), '--lax-size', '3', '16', '24',
-                    '--sax-size', '16', '16', '24']
+                    '--sax-size', '5', '16', '24', '--sax-phase-info', str(phase_info)]
             with patch.object(sys, 'argv', args):
                 preprocess_main()
             data = yaml.safe_load(manifest.read_text())
             records = data['splits']['train']
-            self.assertEqual(len(records), 5)
-            self.assertEqual(len({r['sa']['image'] for r in records}), 1)
-            self.assertEqual(records[0]['center_indices'], {'2ch': 0, '4ch': 0})
-            self.assertEqual(records[-1]['center_indices'], {'2ch': 2, '4ch': 4})
+            self.assertEqual(len(records), 20)
+            self.assertEqual(len({r['sa']['image'] for r in records}), 16)
+            self.assertEqual(records[0]['center_indices'], {'2ch': 0, '4ch': 0, 'sa': 0, 'sa_slice': 0})
+            self.assertEqual(records[-1]['center_indices'], {'2ch': 2, '4ch': 4, 'sa': 3, 'sa_slice': 3})
             with np.load(records[0]['2ch']['image']) as cache:
                 np.testing.assert_array_equal(cache['frame_indices'], [0, 0, 1])
                 self.assertEqual(cache['label'].shape, (16, 24))
                 np.testing.assert_array_equal(cache['image'][0], cache['image'][1])
             cases, info = load_cases_from_yaml(str(manifest), 'train')
-            item = MultiSourceNiftiDataset3D(cases, info['output_sizes'])[4]
+            item = MultiSourceNiftiDataset3D(cases, info['output_sizes'])[-1]
             self.assertEqual(item['image']['2ch'].shape, (1, 3, 16, 24))
             self.assertTrue((item['masks']['2ch'] == 2).all())
             self.assertTrue((item['masks']['4ch'] == 4).all())
@@ -137,14 +140,14 @@ class TemporalTests(unittest.TestCase):
         model = MMFormerAnatomy(base=2, dim=8, heads=2, token_grid=(2, 2, 2), temporal_size=3)
         self.assertIsInstance(model.encoders['2ch'].c1.conv[0], torch.nn.Conv2d)
         self.assertIsInstance(model.encoders['4ch'].patch_embed, torch.nn.Conv2d)
-        self.assertIsInstance(model.encoders['sa'].c1.conv[0], torch.nn.Conv3d)
+        self.assertIsInstance(model.encoders['sa'].c1.conv[0], torch.nn.Conv2d)
         present = torch.tensor([[1,0,0], [0,1,0], [0,0,1], [1,1,0], [1,0,1], [0,1,1], [1,1,1]], dtype=torch.bool)
-        x = {v: torch.randn(7, 1, *((17, 25, 29) if v == 'sa' else (3, 25, 29))) for v in VIEWS}
-        y = {v: torch.randint(CLASSES[v], (7, *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:]))) for v in VIEWS}
+        x = {v: torch.randn(7, 1, *((5, 25, 29) if v == 'sa' else (3, 25, 29))) for v in VIEWS}
+        y = {v: torch.randint(CLASSES[v], (7, *(x[v].shape[-2:]))) for v in VIEWS}
         result = model(x, present)
-        self.assertEqual(result['patch_shapes'], {'2ch': (4,4), '4ch': (4,4), 'sa': (3,4,4)})
+        self.assertEqual(result['patch_shapes'], {'2ch': (4,4), '4ch': (4,4), 'sa': (4,4)})
         for i,v in enumerate(VIEWS):
-            self.assertEqual(result['logits'][v].shape, (7, CLASSES[v], *(x[v].shape[2:] if v == 'sa' else x[v].shape[-2:])))
+            self.assertEqual(result['logits'][v].shape, (7, CLASSES[v], *(x[v].shape[-2:])))
             self.assertFalse(result['logits'][v][~present[:,i]].any())
         loss = masked_segmentation_loss(result, y)
         loss.backward()
@@ -215,7 +218,7 @@ class TemporalTests(unittest.TestCase):
                     self.assertEqual(head.out_channels, CLASSES[view])
                     head.weight.zero_()
                     head.bias.copy_(torch.arange(head.out_channels))
-        x = {v: torch.randn(2, 1, 3 if v != 'sa' else 16, 16, 24) for v in VIEWS}
+        x = {v: torch.randn(2, 1, 3 if v != 'sa' else 5, 16, 24) for v in VIEWS}
         present = torch.tensor([[1, 1, 1], [0, 0, 1]])
         outputs = model(x, present)
         for view in VIEWS[:2]:
@@ -234,7 +237,7 @@ class TemporalTests(unittest.TestCase):
 
     def test_all_input_frames_affect_predictions(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2, temporal_size=3).eval()
-        x = {v: torch.randn(1, 1, 3 if v != 'sa' else 16, 16, 24) for v in VIEWS}
+        x = {v: torch.randn(1, 1, 3 if v != 'sa' else 5, 16, 24) for v in VIEWS}
         present = torch.tensor([[1, 0, 0]])
         with torch.no_grad():
             baseline = model(x, present)['logits']['2ch']
@@ -278,7 +281,7 @@ class TemporalTests(unittest.TestCase):
             def forward(self, x, mask):
                 self.calls += 1
                 self.assert_shapes(x)
-                logits = {v: torch.cat((-a, a), dim=1) if v == 'sa' else torch.cat((-a[:, :, 1], a[:, :, 1]), dim=1) for v,a in x.items()}
+                logits = {v: torch.cat((-a[:, :, 0], a[:, :, 0]), dim=1) if v == 'sa' else torch.cat((-a[:, :, 1], a[:, :, 1]), dim=1) for v,a in x.items()}
                 return {'logits': logits}
             @staticmethod
             def assert_shapes(x):
@@ -286,15 +289,15 @@ class TemporalTests(unittest.TestCase):
         model = FrameModel().eval()
         images = {v: torch.randn(2, 1, 3 if v == '2ch' else 4, 8, 8) for v in VIEWS}
         present = torch.tensor([[1,1,1],[0,1,1]], dtype=torch.bool)
-        result = predict_cine(model, images, present)
-        self.assertEqual(model.calls, 4)
+        result = predict_cine(model, images, present, sax_phases=2)
+        self.assertEqual(model.calls, 8)
         for i,v in enumerate(VIEWS):
             expected = (images[v][:,0] > 0).long()
             expected[~present[:,i]] = 0
             torch.testing.assert_close(result[v], expected)
         model.calls = 0
-        result = predict_cine(model, images, torch.tensor([[0,0,1],[0,0,1]]))
-        self.assertEqual(model.calls, 1)
+        result = predict_cine(model, images, torch.tensor([[0,0,1],[0,0,1]]), sax_phases=2)
+        self.assertEqual(model.calls, 4)
         self.assertEqual(set(result), {'sa'})
 
 

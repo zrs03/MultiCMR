@@ -1,4 +1,4 @@
-"""Framewise LAX and 3D SAX with sequential anatomy cross-attention.
+"""Temporal LAX and spatiotemporal 2.5D SAX with sequential anatomy cross-attention.
 Five anatomy tokens condition per-view, per-scale decoder FiLM.
 Missing views are excluded from attention keys in both stages.
 """
@@ -328,7 +328,7 @@ class AnatomyAwareProgressiveDecoder(nn.Module):
         # LAX shares the upsampling convolutions; spatial adapters are independent.
         self.spatial_adapters = nn.ModuleDict({
             v: nn.ModuleList([ViewSpatialAdapter(c) for c in (base * 4, base * 2, base)])
-            for v in view_token_counts if spatial_dims == 2
+            for v in view_token_counts if spatial_dims == 2 and v != 'sa'
         })
 
     def forward(self, skips: Sequence[Tensor], anatomy: Tensor, availability: Tensor, view: str):
@@ -381,9 +381,8 @@ class MMFormerAnatomy(nn.Module):
         self.in_channels = in_channels
         self.temporal_size = temporal_size
         self.encoders = nn.ModuleDict({
-            v: (HybridViewEncoder(in_channels, base, dim, token_grid, intra_layers, heads)
-                if v == 'sa' else CineViewEncoder(in_channels, base, dim, token_grid,
-                                                  intra_layers, heads, temporal_size))
+            v: CineViewEncoder(in_channels, base, dim, token_grid, intra_layers, heads,
+                               5 if v == 'sa' else temporal_size)
             for v in VIEWS})
         self.modality_embedding = nn.Parameter(torch.randn(3, 1, dim) * .02)
         self.inter = TwoStageAnatomyTransformer(
@@ -391,43 +390,44 @@ class MMFormerAnatomy(nn.Module):
             inter_layers, token_drop_rate=token_drop_rate)
         self.context_scale = nn.Parameter(torch.tensor(.1))
         token_counts = {v: int(getattr(self, f'anatomy_available_{v}').sum()) for v in VIEWS}
-        self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']})
+        self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']}, spatial_dims=2)
         self.decoder_2d = AnatomyAwareProgressiveDecoder(
             base, dim, {v: token_counts[v] for v in VIEWS[:2]}, spatial_dims=2)
         # LAX heads predict only the center frame.
         output_channels = dict(self.num_classes_by_source)
-        self.heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
+        self.heads = nn.ModuleDict({v: nn.Conv2d(base, output_channels[v], 1)
                                    for v in VIEWS})
         self.deep_heads = nn.ModuleDict({
-            v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base * 2, output_channels[v], 1)
+            v: nn.Conv2d(base * 2, output_channels[v], 1)
             for v in VIEWS})
-        self.aux_decoder = ProgressiveDecoder(base, dim)
+        self.aux_decoder = ProgressiveDecoder(base, dim, spatial_dims=2)
         self.aux_decoder_2d = ProgressiveDecoder(base, dim, spatial_dims=2)
-        self.aux_heads = nn.ModuleDict({v: (nn.Conv3d if v == 'sa' else nn.Conv2d)(base, output_channels[v], 1)
+        self.aux_heads = nn.ModuleDict({v: nn.Conv2d(base, output_channels[v], 1)
                                        for v in VIEWS})
     def forward(self, x: Mapping[str, Tensor], modality_mask: Tensor) -> Dict:
-        """LAX: [B,C,T,H,W] or [B,C*T,H,W]; SAX: [B,C,D,H,W].
+        """LAX: [B,C,T,H,W]; SAX: [B,C,5,H,W] (center,t-,t+,z-,z+).
 
-        LAX logits return [B,classes,H,W] for the window center, including auxiliary heads.
+        All view logits return [B,classes,H,W] for the window center, including auxiliary heads.
         The temporal length must match the configured temporal_size (default 5).
         """
         if not isinstance(x, Mapping) or set(x) != set(VIEWS):
             raise ValueError('x must be a mapping with 2ch, 4ch and sa tensors')
         x = dict(x)
-        for view in VIEWS[:2]:
+        for view in VIEWS:
+            channels = 5 if view == 'sa' else self.temporal_size
             image = x[view]
             if image.ndim == 4:
-                if image.shape[1] != self.in_channels * self.temporal_size:
-                    raise ValueError(f'{view} expects {self.in_channels * self.temporal_size} input channels')
-                x[view] = image.reshape(image.shape[0], self.in_channels, self.temporal_size,
-                                        *image.shape[-2:])
+                if image.shape[1] != self.in_channels * channels:
+                    raise ValueError(f'{view} expects {self.in_channels * channels} input channels')
+                x[view] = image.reshape(image.shape[0], self.in_channels, channels, *image.shape[-2:])
         reference = x['sa']
         batch = reference.shape[0]
         for view in VIEWS:
+            channels = 5 if view == 'sa' else self.temporal_size
             if x[view].ndim != 5 or x[view].shape[:2] != (batch, self.in_channels):
-                raise ValueError(f'{view} expects [B,C,' + ('D,H,W]' if view == 'sa' else 'T,H,W]'))
-            if view != 'sa' and x[view].shape[2] != self.temporal_size:
-                raise ValueError(f'{view} expects T={self.temporal_size}, got T={x[view].shape[2]}')
+                raise ValueError(f'{view} expects [B,C,K,H,W]')
+            if x[view].shape[2] != channels:
+                raise ValueError(f'{view} expects T={channels}, got T={x[view].shape[2]}')
             if x[view].device != reference.device:
                 raise ValueError('All views must be on the same device')
         if modality_mask.shape != (batch, 3):
@@ -439,7 +439,7 @@ class MMFormerAnatomy(nn.Module):
         chans = (self.base, self.base * 2, self.base * 4, self.dim)
         for i, view in enumerate(VIEWS):
             image = x[view]
-            shapes = [tuple(image.shape[2:] if view == 'sa' else image.shape[-2:])]
+            shapes = [tuple(image.shape[-2:])]
             for _ in range(3):
                 previous = shapes[-1]
                 shapes.append(tuple((n + 1) // 2 for n in previous))
@@ -464,17 +464,16 @@ class MMFormerAnatomy(nn.Module):
         for i, view in enumerate(VIEWS):
             indices = present[:, i].nonzero(as_tuple=True)[0]
             nclasses = self.num_classes_by_source[view]
-            output_shape = (batch, nclasses, *(x[view].shape[2:] if view == 'sa' else x[view].shape[-2:]))
+            output_shape = (batch, nclasses, *(x[view].shape[-2:]))
             if not indices.numel():
                 logits[view] = reference.new_zeros(output_shape)
                 if self.training:
                     aux_logits[view] = reference.new_zeros(output_shape)
                     deep_logits[view] = reference.new_zeros(output_shape)
                 continue
-            is_2d = view != 'sa'
-            mode = 'bilinear' if is_2d else 'trilinear'
-            decoder = self.decoder_2d if is_2d else self.decoder
-            aux_decoder = self.aux_decoder_2d if is_2d else self.aux_decoder
+            mode = 'bilinear'
+            decoder = self.decoder if view == 'sa' else self.decoder_2d
+            aux_decoder = self.aux_decoder if view == 'sa' else self.aux_decoder_2d
             sk = [f.index_select(0, indices) for f in skip_maps[view]]
             patch = fused[view].index_select(0, indices).transpose(1, 2)
             patch = patch.reshape(indices.numel(), self.dim, *patch_shapes[view])
@@ -485,7 +484,7 @@ class MMFormerAnatomy(nn.Module):
                                   getattr(self, f'anatomy_available_{view}'), view)
 
             def restore(pred):
-                size = output_shape[-2:] if is_2d else output_shape[2:]
+                size = output_shape[-2:]
                 pred = F.interpolate(pred, size=size, mode=mode, align_corners=False)
                 return pred.new_zeros(output_shape).index_copy(0, indices, pred)
 

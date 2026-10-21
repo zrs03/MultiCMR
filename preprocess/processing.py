@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 VIEWS = ('2ch', '4ch', 'sa')
 DEFAULT_OUTPUT_SIZES = {'2ch': (5, 128, 128), '4ch': (5, 128, 128),
-                        'sa': (128, 128, 128)}
+                        'sa': (5, 128, 128)}
 
 
 def validate_output_sizes(output_sizes=None):
@@ -21,6 +21,8 @@ def validate_output_sizes(output_sizes=None):
         sizes[view] = tuple(int(n) for n in size)
     if sizes['2ch'] != sizes['4ch'] or sizes['2ch'][0] % 2 != 1:
         raise ValueError('LAX sizes must agree and use a positive odd window length')
+    if sizes['sa'][0] != 5:
+        raise ValueError('SAX context must have 5 channels: center, t-1, t+1, z-1, z+1')
     return sizes
 
 
@@ -46,7 +48,7 @@ def resize_array(array, size, is_label=False):
 
 
 def prepare_nifti(path, view, output_size, is_label=False):
-    """Preserve LAX time; resize only space. SAX retains legacy stack resizing."""
+    """Preserve all native frames; resize H/W only, including flattened SAX."""
     nii = nib.load(str(path))
     array = nii.get_fdata(dtype=np.float32)
     original_shape = array.shape
@@ -57,25 +59,20 @@ def prepare_nifti(path, view, output_size, is_label=False):
         nonzero = array[np.abs(array) > 1e-8]
         if nonzero.size:
             array = (array - nonzero.mean()) / max(float(nonzero.std()), 1e-8)
-    # Preserve native LAX frames; resize spatial dimensions independently.
-    if view != 'sa':
-        tensor = torch.from_numpy(np.ascontiguousarray(array)).float()[:, None]
-        kwargs = {} if is_label else {'align_corners': False}
-        array = F.interpolate(tensor, size=tuple(output_size[-2:]),
-                              mode='nearest' if is_label else 'bilinear', **kwargs)[:, 0].numpy()
-    else:
-        array = resize_array(array, output_size, is_label=is_label)
+    # Never interpolate the flattened slice/phase axis.
+    tensor = torch.from_numpy(np.ascontiguousarray(array)).float()[:, None]
+    kwargs = {} if is_label else {'align_corners': False}
+    array = F.interpolate(tensor, size=tuple(output_size[-2:]),
+                          mode='nearest' if is_label else 'bilinear', **kwargs)[:, 0].numpy()
     return array.astype(np.int64 if is_label else np.float32), nii.affine, original_shape
 
 
 def load_view(path, view, output_size, is_label=False, complete_cine=False):
-    """Read a raw NIfTI or a preprocessed NPZ without transposing it twice."""
+    """Read a context/full NPZ with an explicit layout."""
     if Path(path).suffix != '.npz':
-        if not complete_cine:
-            raise ValueError('Window samples require offline NPZ caches; rerun preprocessing')
-        return prepare_nifti(path, view, output_size, is_label)
+        raise ValueError('SAX context schema requires offline NPZ caches with phase metadata; rerun preprocessing')
     with np.load(path, allow_pickle=False) as data:
-        expected_layout = ('THW' if complete_cine else 'KHW') if view != 'sa' else 'DHW'
+        expected_layout = ('FHW' if view == 'sa' else 'THW') if complete_cine else 'KHW'
         if str(data['view']) != view or str(data['layout']) != expected_layout:
             raise ValueError(f'Invalid view/layout in {path}')
         key = 'label' if is_label else 'image'
@@ -83,7 +80,7 @@ def load_view(path, view, output_size, is_label=False, complete_cine=False):
             raise ValueError(f'{path} has no {key}')
         array = data[key].copy()
         affine, original_shape = data['affine'].copy(), tuple(data['original_shape'])
-    expected = (array.shape[0], *output_size[-2:]) if complete_cine and view != 'sa' else (output_size[-2:] if is_label and view != 'sa' else output_size)
+    expected = (array.shape[0], *output_size[-2:]) if complete_cine else (output_size[-2:] if is_label else output_size)
     if tuple(array.shape) != tuple(expected):
         raise ValueError(f'{path}: cached size {array.shape} != requested {tuple(output_size)}; '
                          'regenerate preprocessing with the requested per-view sizes')
@@ -102,3 +99,31 @@ def paired_centers(lengths):
     count = max(lengths.values())
     return [{v: int(np.rint(i * (n - 1) / max(count - 1, 1))) for v, n in lengths.items()}
             for i in range(count)]
+
+
+def validate_sax_geometry(frames, phases):
+    if isinstance(phases, (bool, np.bool_)) or not isinstance(phases, (int, np.integer)) or phases < 1:
+        raise ValueError('SAX phase count must be a positive integer from metadata')
+    if frames < 1 or frames % phases:
+        raise ValueError(f'SAX frame count {frames} is not divisible by phase count {phases}')
+    return frames // phases
+
+
+def reflect_index(index, length):
+    if length < 1:
+        raise ValueError('Cannot reflect an empty axis')
+    if length == 1:
+        return 0
+    index %= 2 * (length - 1)
+    return min(index, 2 * (length - 1) - index)
+
+
+def sax_context_indices(t, z, phases, slices):
+    """Canonical flat layout k=z*T+t. Order is center, t-, t+, z-, z+."""
+    if not 0 <= t < phases or not 0 <= z < slices:
+        raise ValueError('SAX center outside slice/phase range')
+    return np.array([z * phases + t,
+                     z * phases + reflect_index(t - 1, phases),
+                     z * phases + reflect_index(t + 1, phases),
+                     reflect_index(z - 1, slices) * phases + t,
+                     reflect_index(z + 1, slices) * phases + t], dtype=np.int64)

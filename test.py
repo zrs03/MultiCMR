@@ -4,8 +4,8 @@ Compatible with train.py's load_cases_from_yaml / MultiSourceNiftiDataset3D
 and MMFormerAnatomy(x, modality_mask) interface.
 
 Example:
-  python test.py --split-yaml preprocess/matched.yaml \
-    --checkpoint checkpoints/best_model_3d_multihead.pth --split test
+  python test.py --split-yaml preprocess/matched_sax_context.yaml \
+    --checkpoint checkpoints_sax_context/best_model_3d_multihead.pth --split test
 
 LAX enters as centered temporal windows; outputs are reconstructed to native frame counts. Exports use model space: LAX [H,W,1,T] and SAX [H,W,D].
 """
@@ -96,9 +96,13 @@ def normalize_item_image(images, source_order):
     return result
 
 
-def evaluate_prediction(pred, target, view, classes):
+def evaluate_prediction(pred, target, view, classes, sax_phases=None):
     if view == 'sa':
-        return multiclass_dice_iou_hd95(pred, target, classes)[:3]
+        from preprocess.processing import validate_sax_geometry
+        validate_sax_geometry(pred.shape[0], sax_phases)
+        values = [multiclass_dice_iou_hd95(pred[t::sax_phases], target[t::sax_phases], classes)[:3]
+                  for t in range(sax_phases)]
+        return tuple(np.asarray(values).mean(axis=0))
     # Distances are spatial and must not use time as a third spatial axis.
     values = [multiclass_dice_iou_hd95(p, y, classes)[:3] for p, y in zip(pred, target)]
     return tuple(np.asarray(values).mean(axis=0))
@@ -130,12 +134,12 @@ def make_model(config, order, classes, device):
 
 def main():
     pa = argparse.ArgumentParser(description='YAML test/val evaluation for multi-view MMFormerAnatomy')
-    pa.add_argument('--split-yaml', default='preprocess/matched.yaml')
+    pa.add_argument('--split-yaml', default='preprocess/matched_sax_context.yaml')
     pa.add_argument('--split', choices=['train','val','test'], default='val')
     pa.add_argument('--checkpoint', required=True)
     pa.add_argument('--output-dir', default='results_mmformer')
     pa.add_argument('--lax-size', type=int, nargs=3, default=None, help='2CH/4CH K H W')
-    pa.add_argument('--sax-size', type=int, nargs=3, default=None, help='SAX D H W')
+    pa.add_argument('--sax-size', type=int, nargs=3, default=None, help='SAX K H W (K=5)')
     pa.add_argument('--source-order', nargs='+', default=None)
     pa.add_argument('--num-classes-json', default=None)
     pa.add_argument('--base', type=int, default=None)
@@ -183,7 +187,7 @@ def main():
         sizes['sa'] = args.sax_size
     sizes = validate_output_sizes(sizes)
     if checkpoint.get('architecture') != ARCHITECTURE:
-        raise ValueError('Checkpoint is not a joint-LAX patch attention / SAX anatomy cross-attention patch-size-1 model (v14, single-scale deep supervision). Use a checkpoint trained with the current architecture.')
+        raise ValueError('Checkpoint is not a SAX spatiotemporal 2.5D model (v18). Use a checkpoint trained with the current architecture.')
     cfg = dict(checkpoint['model_config'])
     if any(sizes[v][0] != cfg['temporal_size'] for v in VIEWS[:2]):
         raise ValueError('Window size differs between checkpoint and requested preprocessing')
@@ -215,7 +219,7 @@ def main():
     print('Evaluation mode:', args.eval_mode, '| random seed:', args.seed)
     print('NOTE: Missing-view predictions are not supported by this architecture; '
           'only present-view segmentations are evaluated in each scenario.')
-    print('Model-space exports: LAX [H,W,1,T], SAX [H,W,D]; LAX metrics are framewise.')
+    print('Model-space exports: LAX [H,W,1,T], SAX [H,W,Z*T] with k=z*T+t; SAX metrics are per-phase 3D in model-grid units.')
     with torch.inference_mode():
         for idx in range(len(dataset)):
             item = dataset[idx]
@@ -232,7 +236,7 @@ def main():
                 scenarios.extend((f'mask_{"".join(map(str, m))}', m) for m in all_masks)
             for scenario, mask_values in scenarios:
                 present = torch.tensor(mask_values, dtype=torch.bool, device=device).unsqueeze(0)
-                predictions = predict_cine(model, images, present, fp16=args.fp16)
+                predictions = predict_cine(model, images, present, fp16=args.fp16, sax_phases=item['sax_phases'])
                 for vi, view in enumerate(order):
                     if not mask_values[vi]:
                         continue  # Never score absent-view zero placeholders.
@@ -243,7 +247,7 @@ def main():
                         gt = torch.as_tensor(gt).long().cpu()
                         if tuple(gt.shape) != tuple(pred.shape):
                             raise ValueError(f'{view}: prediction and target shapes disagree')
-                        values = evaluate_prediction(pred, gt, view, classes[view])
+                        values = evaluate_prediction(pred, gt, view, classes[view], sax_phases=item['sax_phases'])
                         for name, value in zip(('dice','iou','hd95'), values[:3]):
                             score = metric_scalar(value)
                             if np.isfinite(score):
@@ -252,7 +256,7 @@ def main():
                     stem = f'{idx:04d}_{identifier}_{view}'
                     per_case.append({'case_index':idx, 'case_id':identifier,
                                      'scenario':scenario, 'mask':''.join(map(str,mask_values)),
-                                     'view':view, **scores})
+                                     'view':view, 'sax_phases':item['sax_phases'], **scores})
                     if not args.no_save_nifti:
                         folder = outdir / scenario
                         folder.mkdir(parents=True, exist_ok=True)
@@ -290,8 +294,9 @@ def main():
         'precision': 'fp16' if args.fp16 else 'fp32',
         'random_seed': args.seed, 'random_repeats': args.random_repeats,
         'output_sizes':{v:list(s) for v,s in sizes.items()},
-        'lax_metrics':'mean over 2D frames', 'network_input':'centered LAX windows + shared 3D SAX',
-        'sax_aggregation':'mean window probabilities', 'pairing':'nearest normalized sequence position',
+        'lax_metrics':'mean over 2D frames', 'network_input':'LAX windows + SAX center/t-/t+/z-/z+ channels',
+        'sax_metrics':'mean over spatial phase volumes; model-grid distances', 'sax_flat_order':'slice_phase',
+        'sax_aggregation':'average duplicates within each (phase,slice), never across phases', 'pairing':'nearest normalized sequence position',
         'results':report
     }, indent=2, ensure_ascii=False), encoding='utf-8')
     print('Saved outputs to:', outdir)

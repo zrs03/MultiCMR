@@ -21,7 +21,7 @@ class ChannelWindowTests(unittest.TestCase):
     def test_center_output_backpropagates_to_neighbor_frames(self):
         torch.manual_seed(7)
         model = MMFormerAnatomy(base=2, dim=8, heads=2, temporal_size=3).eval()
-        images = {v: torch.randn(1,1,16 if v=='sa' else 3,16,16, requires_grad=True)
+        images = {v: torch.randn(1,1,5 if v=='sa' else 3,16,16, requires_grad=True)
                   for v in ('2ch','4ch','sa')}
         result = model(images, torch.tensor([[1,0,1]]))
         self.assertEqual(result['logits']['2ch'].shape, (1,3,16,16))

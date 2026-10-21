@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Center-window long-axis + 3D SAX segmentation.
+# LAX temporal windows + SAX spatial/temporal 2.5D contexts.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 MODE="${1:-train}"
 DATA_ROOT="${DATA_ROOT:-rawdata/CINE_MULTI}"
-SPLIT_YAML="${SPLIT_YAML:-preprocess/matched.yaml}"
-PREPROCESS_DIR="${PREPROCESS_DIR:-preprocess/processed}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints}"
+SPLIT_YAML="${SPLIT_YAML:-preprocess/matched_sax_context.yaml}"
+PREPROCESS_DIR="${PREPROCESS_DIR:-preprocess/processed_sax_context}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints_sax_context}"
 RESULT_DIR="${RESULT_DIR:-results}"
 CHECKPOINT="${CHECKPOINT:-${OUTPUT_DIR}/best_model_3d_multihead.pth}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -46,8 +46,15 @@ if [[ -n "${RESUME:-}" ]]; then
 fi
 case "$MODE" in
   preprocess)
+    phase_args=(--sax-phase-info "${SAX_PHASE_INFO:-rawdata/id_mapping.json}")
+    for split in train val test; do
+      key="SAX_PHASE_INFO_${split^^}"
+      if [[ -n "${!key:-}" ]]; then
+        phase_args+=("--sax-phase-info-$split" "${!key}")
+      fi
+    done
     python -m preprocess.preprocess --data-root "$DATA_ROOT" --output-yaml "$SPLIT_YAML" \
-      --output-dir "$PREPROCESS_DIR" "${size_args[@]}"
+      --output-dir "$PREPROCESS_DIR" "${size_args[@]}" "${phase_args[@]}"
     ;;
   train)
     python train.py "${train_args[@]}" --device "$DEVICE"
@@ -69,20 +76,21 @@ case "$MODE" in
   -h|--help)
     cat <<'EOF'
 Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
-  preprocess: cache 2CH/4CH [5,128,128] windows, center labels [128,128], SAX [128,128,128] (D,H,W)
-  train: paired LAX windows + shared SAX; center-frame supervision
-  test: sliding windows reconstruct native LAX frames; average SAX probabilities; default split=val
+  preprocess: cache 2CH/4CH [5,128,128] windows, center labels [128,128], SAX [5,128,128] context channels, center labels [128,128]
+  train: paired LAX windows + SAX (phase,slice) context; center-frame supervision
+  test: sliding windows reconstruct native LAX frames; reconstruct each SAX phase/slice; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
   DEEP_WEIGHT (default .1; 0 disables single-scale supervision),
   FP16 (0=FP32 default; 1=CUDA FP16 AMP), TOKEN_DROP_RATE (default .05 including resume; 0 disables),
-  WINDOWS_PER_PATIENT (default 4; 0=all), AFFINE_PROB, ROTATION_DEGREES,
+  WINDOWS_PER_PATIENT (default 4 center-slice samples; consider 32; 0=all), AFFINE_PROB, ROTATION_DEGREES,
   TRANSLATION_FRACTION, SCALE_FRACTION, WEIGHT_DECAY (AdamW default 1e-4),
   CHECKPOINT, DEVICE, BATCH_SIZE, EPOCHS, LR, NUM_WORKERS, NUM_GPUS, GPU_DEVICES,
-  LAX_SIZE, SAX_SIZE, SPLIT, EVAL_MODE, RESUME (checkpoint path; EPOCHS is total target).
+  SAX_PHASE_INFO (default rawdata/id_mapping.json), SAX_PHASE_INFO_TRAIN/VAL/TEST,
+  LAX_SIZE, SAX_SIZE (5 H W), SPLIT, EVAL_MODE, RESUME (checkpoint path; EPOCHS is total target).
 Examples:
   bash run.sh preprocess
   DEVICE=cuda:0 bash run.sh train
-  RESUME=checkpoints/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-multi-gpu
+  RESUME=checkpoints_sax_context/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-multi-gpu
   SPLIT=test EVAL_MODE=all-seven bash run.sh test
   EF_DATA_DIR=/path/to/original_space_masks bash run.sh eval-ef
 EOF

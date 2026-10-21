@@ -109,8 +109,8 @@ def load_cases_from_yaml(
         {},
     )
 
-    if dataset_info.get('schema') != 'center_window_v1':
-        raise ValueError('Old cine manifest: rerun bash run.sh preprocess for center-window samples')
+    if dataset_info.get('schema') != 'sax_context_v2':
+        raise ValueError('Old cine manifest: rerun bash run.sh preprocess for SAX slice/phase context samples')
 
     # --------------------------------------------------------
     # Resolve data root
@@ -308,18 +308,21 @@ class MultiSourceNiftiDataset3D(Dataset):
                     raise ValueError(f'Label range out of bounds: case={item.case_id}, source={source}')
             if self.augment:
                 # Flip spatial axes only: never reverse the LAX temporal axis.
-                axes = range(image.ndim) if source == 'sa' else (image.ndim - 2, image.ndim - 1)
+                axes = (image.ndim - 2, image.ndim - 1)
                 for axis in axes:
                     if np.random.rand() < .5:
                         image = np.flip(image, axis=axis)
                         if label is not None:
-                            label_axis = axis - 1 if source != 'sa' and not self.complete_cine else axis
+                            label_axis = axis - 1 if not self.complete_cine else axis
                             label = np.flip(label, axis=label_axis)
                 image, label = random_spatial_affine(image, label, **self.affine_config)
             images[source] = torch.from_numpy(np.ascontiguousarray(image)).float().unsqueeze(0)
             if label is not None:
                 masks[source] = torch.from_numpy(np.ascontiguousarray(label)).long()
+        with np.load(item.image_paths['sa'], allow_pickle=False) as sax_cache:
+            sax_phases = int(sax_cache['sax_phases'])
         return {
+            'sax_phases': sax_phases,
             'image': images, 'masks': masks, 'case_id': item.case_id, 'sample_id': item.sample_id,
             'image_paths': item.image_paths, 'label_paths': item.label_paths,
             'affines': affines, 'original_shapes': original_shapes,

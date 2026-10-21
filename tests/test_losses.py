@@ -34,7 +34,7 @@ class LossTests(unittest.TestCase):
     def test_single_scale_training_only_and_gradients(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2, temporal_size=3)
         self.assertEqual(len(model.deep_heads), 3)
-        x = {v: torch.randn(1, 1, 16 if v == 'sa' else 3, 16, 16)
+        x = {v: torch.randn(1, 1, 5 if v == 'sa' else 3, 16, 16)
              for v in ('2ch', '4ch', 'sa')}
         result = model(x, torch.ones(1, 3))
         self.assertEqual(set(result['deep_logits']), {'2ch', '4ch', 'sa'})
