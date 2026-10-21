@@ -31,8 +31,11 @@ def main():
             try:
                 if len(shapes['sa']) != 3:
                     raise ValueError('Expected flattened 3D SAX array')
-                slices = validate_sax_geometry(shapes['sa'][-1], phases)
-                status = f'SAX divisible: Z={slices}, T={phases} (ordering still requires metadata)'
+                slices = validate_sax_geometry(shapes['sa'][-1], phases, allow_partial=True)
+                tail = shapes['sa'][-1] - slices * phases
+                status = f'SAX complete slices: Z={slices}, T={phases}; valid_frames={slices * phases}; tail_frames={tail}'
+                if tail:
+                    status = 'WARNING truncation: ' + status
             except ValueError as exc:
                 status = f'ERROR: {exc}'
                 errors += 1

@@ -99,7 +99,8 @@ def normalize_item_image(images, source_order):
 def evaluate_prediction(pred, target, view, classes, sax_phases=None):
     if view == 'sa':
         from preprocess.processing import validate_sax_geometry
-        validate_sax_geometry(pred.shape[0], sax_phases)
+        validate_sax_geometry(pred.shape[0], sax_phases, allow_partial=True)
+        # Keep original tail labels in metrics, including any missed foreground.
         values = [multiclass_dice_iou_hd95(pred[t::sax_phases], target[t::sax_phases], classes)[:3]
                   for t in range(sax_phases)]
         return tuple(np.asarray(values).mean(axis=0))

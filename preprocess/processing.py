@@ -101,10 +101,13 @@ def paired_centers(lengths):
             for i in range(count)]
 
 
-def validate_sax_geometry(frames, phases):
+def validate_sax_geometry(frames, phases, allow_partial=False):
+    """Return complete slice count; optionally exclude a trailing partial slice."""
     if isinstance(phases, (bool, np.bool_)) or not isinstance(phases, (int, np.integer)) or phases < 1:
         raise ValueError('SAX phase count must be a positive integer from metadata')
-    if frames < 1 or frames % phases:
+    if frames < phases:
+        raise ValueError(f'SAX frame count {frames} contains no complete slice with {phases} phases')
+    if frames % phases and not allow_partial:
         raise ValueError(f'SAX frame count {frames} is not divisible by phase count {phases}')
     return frames // phases
 

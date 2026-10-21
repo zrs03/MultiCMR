@@ -39,6 +39,41 @@ class SAXContextTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_output_sizes({'2ch': (5,16,16), '4ch': (5,16,16), 'sa': (128,16,16)})
 
+    def test_partial_slice_truncation_and_background_restore(self):
+        self.assertEqual(validate_sax_geometry(290, 25, allow_partial=True), 11)
+        with self.assertRaises(ValueError):
+            validate_sax_geometry(3, 4, allow_partial=True)
+
+        class ForegroundModel(torch.nn.Module):
+            temporal_size = 5
+            def __init__(self):
+                super().__init__()
+                self.seen = []
+            def forward(self, images, mask):
+                self.seen.extend(images['sa'][0, 0, :, 0, 0].tolist())
+                logits = torch.zeros(1, 4, 2, 2)
+                logits[:, 1] = 10
+                return {'logits': {v: logits for v in images}}
+
+        model = ForegroundModel().eval()
+        images = {v: torch.zeros(1, 1, 4, 2, 2) for v in ('2ch', '4ch')}
+        images['sa'] = torch.arange(10).float().view(1, 1, 10, 1, 1).expand(-1, -1, -1, 2, 2)
+        pred = predict_cine(model, images, torch.tensor([[0, 0, 1]]), sax_phases=4)['sa']
+        self.assertEqual(pred.shape, (1, 10, 2, 2))
+        self.assertTrue((pred[:, :8] == 1).all())
+        self.assertTrue((pred[:, 8:] == 0).all())
+        self.assertEqual(len(model.seen), 8 * 5)
+        self.assertLess(max(model.seen), 8)
+        from unittest.mock import patch
+        observed = []
+        def metric(p, y, classes):
+            observed.extend(y[:, 0, 0].tolist())
+            return (1., 1., 0.)
+        target = torch.arange(10).view(10, 1, 1).expand(-1, 2, 2)
+        with patch('test.multiclass_dice_iou_hd95', side_effect=metric):
+            evaluate_prediction(pred[0], target, 'sa', 4, sax_phases=4)
+        self.assertEqual(sorted(observed), list(range(10)))
+
     def test_sax_center_head_uses_all_five_channels(self):
         torch.manual_seed(16)
         model = MMFormerAnatomy(base=2, dim=8, heads=2).eval()

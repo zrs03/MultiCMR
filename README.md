@@ -24,7 +24,7 @@ I(t,z), I(t-1,z), I(t+1,z), I(t,z-1), I(t,z+1)
 
 ## SAX 排列与预处理
 
-默认从 `DATA_ROOT`（默认 `rawdata/CINE_MULTI`）按划分读取相位数 T：train 使用 `sax_slice_info.json`，val 使用 `id_slice_info_valid.json`，test 使用 `sax_slice_info_test.json`。不再默认使用仅含训练病例的 `rawdata/id_mapping.json`。显式路径优先级为：划分专属覆盖 > 通用覆盖 > 数据根目录下的默认文件；缺失文件不会自动回退到其他划分。采用 **k=z*T+t**：一个空间切片内的所有相位连续排列。原始 `[H,W,Z*T]` 保留全部帧，只缩放 H/W，绝不沿混合轴插值。总帧数必须能被 T 整除，缺少病例、非正整数相位数或整除失败会报错，不猜测。
+默认从 `DATA_ROOT`（默认 `rawdata/CINE_MULTI`）按划分读取相位数 T：train 使用 `sax_slice_info.json`，val 使用 `id_slice_info_valid.json`，test 使用 `sax_slice_info_test.json`。不再默认使用仅含训练病例的 `rawdata/id_mapping.json`。显式路径优先级为：划分专属覆盖 > 通用覆盖 > 数据根目录下的默认文件；缺失文件不会自动回退到其他划分。采用 **k=z*T+t**：一个空间切片内的所有相位连续排列。原始 `[H,W,Z*T]` 保留全部帧，只缩放 H/W，绝不沿混合轴插值。若总帧数不能被 T 整除，按 `Z=F//T` 只用前 `Z*T` 帧构造训练及推理窗口，尾部不完整切片不作为中心或邻居，并打印警告。例如 290 帧、T=25 时使用 275 帧，排除尾部 15 帧。完整病例缓存仍保留原图和原标签，并记录 `sax_valid_frames` / `sax_tail_frames`；推理输出恢复原始帧数，尾部填背景，评估保留尾部真实标签，不掩盖其中的前景漏检。缺少病例、非正整数相位数或不足一个完整切片仍报错；截断不代表相位表已经验证正确。
 
 SAX 时间与空间边界均用反射；长度为 1 时重复自身。反射分别在 T 和 Z 上执行，时间邻居不会跨到另一切片，空间邻居不会跨越心底/心尖。长轴仍保留原 edge 时间窗边界规则。
 

@@ -93,14 +93,24 @@ def main():
                         raise ValueError(f'Missing SAX phase count for {split}/{case_id}; supply --sax-phase-info-{split}')
                     phases = phase_info[str(int(case_id))]
                     try:
-                        slices = validate_sax_geometry(image.shape[0], phases)
+                        slices = validate_sax_geometry(image.shape[0], phases, allow_partial=True)
                     except ValueError as exc:
                         raise ValueError(
                             f'{split}/{case_id}: {image_path}; original_shape={shape}; '
                             f'phase_table={path}; phases={phases}. {exc}. '
-                            'Check acquisition metadata; do not truncate frames or guess a divisor. '
+                            'Check acquisition metadata; do not guess a divisor. '
                             'Run python -m preprocess.audit_geometry to audit all cases.'
                         ) from exc
+                    valid_frames = slices * phases
+                    tail_frames = image.shape[0] - valid_frames
+                    if tail_frames:
+                        foreground = (f", tail foreground pixels={np.count_nonzero(arrays['label'][valid_frames:])}"
+                                      if 'label' in arrays else '')
+                        print(f'WARNING {split}/{case_id}: SAX keeps {valid_frames}/{image.shape[0]} frames '
+                              f'(Z={slices}, T={phases}); excluding {tail_frames} trailing frames from '
+                              f'training contexts; inference tail will be background{foreground}', flush=True)
+                    # Preserve original images/labels for export and honest evaluation.
+                    arrays.update(sax_valid_frames=np.array(valid_frames), sax_tail_frames=np.array(tail_frames))
                     arrays.update(sax_phases=np.array(phases), sax_slices=np.array(slices),
                                   flat_order=np.array('slice_phase'))
                 cached[view] = arrays

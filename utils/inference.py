@@ -11,7 +11,8 @@ def predict_cine(model, images, modality_mask, fp16=False, sax_phases=None):
 
     The phase count is required metadata, never inferred from image contents.
     Average duplicate predictions ONLY for the same output frame, never across
-    phases. LAX predictions may be averaged over different SAX slice contexts.
+    phases. A trailing partial SAX slice is excluded from contexts and predicted
+    as background at the original frame count. LAX predictions may be averaged over different SAX slice contexts.
     """
     device_type = images['sa'].device.type
     if fp16 and device_type != 'cuda':
@@ -22,7 +23,7 @@ def predict_cine(model, images, modality_mask, fp16=False, sax_phases=None):
         raise ValueError('Expected nonempty modality_mask [B,3]')
     if any(x.ndim != 5 or x.shape[1] != 1 for x in images.values()):
         raise ValueError('Expected per-view [B,1,F,H,W] inputs')
-    slices = validate_sax_geometry(images['sa'].shape[2], sax_phases)
+    slices = validate_sax_geometry(images['sa'].shape[2], sax_phases, allow_partial=True)
     lengths = {v: images[v].shape[2] for v in VIEWS[:2]}
     lengths['sa'] = sax_phases
     centers = paired_centers(lengths)
@@ -58,9 +59,11 @@ def predict_cine(model, images, modality_mask, fp16=False, sax_phases=None):
     for i, view in enumerate(VIEWS):
         if view not in sums:
             continue
-        if not (counts[view] > 0).all():
+        valid_frames = slices * sax_phases if view == 'sa' else counts[view].numel()
+        if not (counts[view][:valid_frames] > 0).all():
             raise RuntimeError(f'Uncovered output frames in {view}')
-        pred = (sums[view] / counts[view][None, None, :, None, None]).argmax(1)
+        pred = (sums[view] / counts[view].clamp_min(1)[None, None, :, None, None]).argmax(1)
+        pred[:, valid_frames:] = 0
         pred[~modality_mask[:, i].bool().cpu()] = 0
         predictions[view] = pred
     return predictions
