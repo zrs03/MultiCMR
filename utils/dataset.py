@@ -109,7 +109,7 @@ def load_cases_from_yaml(
         {},
     )
 
-    if dataset_info.get('schema') != 'sax_context_v2':
+    if dataset_info.get('schema') != 'sax_context_v3':
         raise ValueError('Old cine manifest: rerun bash run.sh preprocess for SAX slice/phase context samples')
 
     # --------------------------------------------------------

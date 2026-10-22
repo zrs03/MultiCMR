@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import torch
 
-ARCHITECTURE = 'sax_spatiotemporal_joint_v19'
+ARCHITECTURE = 'mednext_m_2d_joint_v20'
 
 
 def capture_rng_state():

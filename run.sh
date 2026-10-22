@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 MODE="${1:-train}"
 DATA_ROOT="${DATA_ROOT:-rawdata/CINE_MULTI}"
-SPLIT_YAML="${SPLIT_YAML:-preprocess/matched_sax_context.yaml}"
-PREPROCESS_DIR="${PREPROCESS_DIR:-preprocess/processed_sax_context}"
-OUTPUT_DIR="${OUTPUT_DIR:-checkpoints_sax_context}"
+SPLIT_YAML="${SPLIT_YAML:-preprocess/matched_mednext256.yaml}"
+PREPROCESS_DIR="${PREPROCESS_DIR:-preprocess/processed_mednext256}"
+OUTPUT_DIR="${OUTPUT_DIR:-checkpoints_mednext256}"
 RESULT_DIR="${RESULT_DIR:-results}"
 CHECKPOINT="${CHECKPOINT:-${OUTPUT_DIR}/best_model_3d_multihead.pth}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
@@ -79,7 +79,7 @@ case "$MODE" in
   -h|--help)
     cat <<'EOF'
 Usage: bash run.sh {preprocess|train|train-multi-gpu|test|eval-ef}
-  preprocess: cache 2CH/4CH [5,128,128] windows, center labels [128,128], SAX [5,128,128] context channels, center labels [128,128]
+  preprocess: cache 2CH/4CH [5,256,256] windows, center labels [256,256], SAX [5,256,256] context channels, center labels [256,256]
   train: paired LAX windows + SAX (phase,slice) context; center-frame supervision
   test: sliding windows reconstruct native LAX frames; reconstruct each SAX phase/slice; default split=val
 Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
@@ -93,7 +93,7 @@ Environment: DATA_ROOT, SPLIT_YAML, PREPROCESS_DIR, OUTPUT_DIR, RESULT_DIR,
 Examples:
   bash run.sh preprocess
   DEVICE=cuda:0 bash run.sh train
-  RESUME=checkpoints_sax_context/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-multi-gpu
+  RESUME=checkpoints_mednext256/last_model_3d_multihead.pth EPOCHS=300 bash run.sh train-multi-gpu
   SPLIT=test EVAL_MODE=all-seven bash run.sh test
   EF_DATA_DIR=/path/to/original_space_masks bash run.sh eval-ef
 EOF

@@ -6,7 +6,7 @@ from models.model import CineViewEncoder, MMFormerAnatomy
 class ChannelWindowTests(unittest.TestCase):
     def test_default_token_count_and_window_skips(self):
         encoder = CineViewEncoder(1, 2, 8, (2,4,4), 0, 2, temporal_size=5).eval()
-        x = torch.randn(1,1,5,128,128)
+        x = torch.randn(1,1,5,256,256)
         changed = x.clone()
         changed[:, :, 0] += 2
         with torch.no_grad():
@@ -28,7 +28,7 @@ class ChannelWindowTests(unittest.TestCase):
         result['logits']['2ch'].square().mean().backward()
         for t in (0,1,2):
             self.assertGreater(images['2ch'].grad[:,:,t].abs().sum().item(), 0)
-        grad = model.encoders['2ch'].c1.conv[0].weight.grad
+        grad = model.encoders['2ch'].backbone.stem.weight.grad
         self.assertTrue(torch.isfinite(grad).all())
         self.assertGreater(grad.abs().sum().item(), 0)
         self.assertIsNone(images['4ch'].grad)

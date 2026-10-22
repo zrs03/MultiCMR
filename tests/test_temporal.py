@@ -45,10 +45,10 @@ class TemporalTests(unittest.TestCase):
             path = Path(d) / 'cine.nii.gz'
             nib.save(nib.Nifti1Image(raw, np.eye(4)), path)
             label, _, shape = prepare_nifti(path, '2ch', (10, 7, 9), is_label=True)
-            np.testing.assert_array_equal(label[:, 0, 0], np.arange(5))
+            np.testing.assert_array_equal(label[:, 3, 4], np.arange(5))
             self.assertEqual(shape, (7, 9, 5))
-        self.assertEqual(DEFAULT_OUTPUT_SIZES['2ch'], (5, 128, 128))
-        self.assertEqual(DEFAULT_OUTPUT_SIZES['sa'], (5, 128, 128))
+        self.assertEqual(DEFAULT_OUTPUT_SIZES['2ch'], (5, 256, 256))
+        self.assertEqual(DEFAULT_OUTPUT_SIZES['sa'], (5, 256, 256))
 
     def make_case(self, directory):
         sizes = {'2ch': (3, 16, 24), '4ch': (3, 16, 24), 'sa': (5, 16, 24)}
@@ -115,8 +115,8 @@ class TemporalTests(unittest.TestCase):
             cases, info = load_cases_from_yaml(str(manifest), 'train')
             item = MultiSourceNiftiDataset3D(cases, info['output_sizes'])[-1]
             self.assertEqual(item['image']['2ch'].shape, (1, 3, 16, 24))
-            self.assertTrue((item['masks']['2ch'] == 2).all())
-            self.assertTrue((item['masks']['4ch'] == 4).all())
+            self.assertTrue((item['masks']['2ch'][4:12,6:18] == 2).all())
+            self.assertTrue((item['masks']['4ch'][4:12,6:18] == 4).all())
             full, _ = load_cases_from_yaml(str(manifest), 'val', complete_cine=True)
             item = MultiSourceNiftiDataset3D(full, info['output_sizes'], complete_cine=True)[0]
             self.assertEqual(item['image']['2ch'].shape, (1, 3, 16, 24))
@@ -138,14 +138,14 @@ class TemporalTests(unittest.TestCase):
 
     def test_seven_masks_native_patches_and_gradients(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2, token_grid=(2, 2, 2), temporal_size=3)
-        self.assertIsInstance(model.encoders['2ch'].c1.conv[0], torch.nn.Conv2d)
+        self.assertIsInstance(model.encoders['2ch'].backbone.stem, torch.nn.Conv2d)
         self.assertIsInstance(model.encoders['4ch'].patch_embed, torch.nn.Conv2d)
-        self.assertIsInstance(model.encoders['sa'].c1.conv[0], torch.nn.Conv2d)
+        self.assertIsInstance(model.encoders['sa'].backbone.stem, torch.nn.Conv2d)
         present = torch.tensor([[1,0,0], [0,1,0], [0,0,1], [1,1,0], [1,0,1], [0,1,1], [1,1,1]], dtype=torch.bool)
         x = {v: torch.randn(7, 1, *((5, 25, 29) if v == 'sa' else (3, 25, 29))) for v in VIEWS}
         y = {v: torch.randint(CLASSES[v], (7, *(x[v].shape[-2:]))) for v in VIEWS}
         result = model(x, present)
-        self.assertEqual(result['patch_shapes'], {'2ch': (4,4), '4ch': (4,4), 'sa': (4,4)})
+        self.assertEqual(result['patch_shapes'], {'2ch': (2,2), '4ch': (2,2), 'sa': (2,2)})
         for i,v in enumerate(VIEWS):
             self.assertEqual(result['logits'][v].shape, (7, CLASSES[v], *(x[v].shape[-2:])))
             self.assertFalse(result['logits'][v][~present[:,i]].any())
@@ -153,7 +153,7 @@ class TemporalTests(unittest.TestCase):
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
         for p in (model.inter.lax_stage.anatomy_reads.attn.in_proj_weight, model.inter.anatomy_tokens,
-                  model.encoders['2ch'].c1.conv[0].weight, model.encoders['sa'].c1.conv[0].weight):
+                  model.encoders['2ch'].backbone.stem.weight, model.encoders['sa'].backbone.stem.weight):
             self.assertIsNotNone(p.grad)
             self.assertTrue(torch.isfinite(p.grad).all())
             self.assertGreater(float(p.grad.abs().sum()), 0.)
@@ -191,17 +191,17 @@ class TemporalTests(unittest.TestCase):
 
     def test_time_is_fused_as_channels(self):
         encoder = CineViewEncoder(1, 2, 8, (2, 2, 2), 1, 2, temporal_size=3).eval()
-        self.assertEqual(encoder.c1.conv[0].in_channels, 3)
+        self.assertEqual(encoder.backbone.stem.in_channels, 3)
         self.assertFalse(hasattr(encoder, 'temporal_pos'))
         x = torch.randn(2, 1, 3, 16, 24)
         received = []
-        hook = encoder.c1.register_forward_pre_hook(lambda module, args: received.append(args[0].clone()))
+        hook = encoder.backbone.stem.register_forward_pre_hook(lambda module, args: received.append(args[0].clone()))
         with torch.no_grad():
             skips, tokens, shape = encoder(x)
         hook.remove()
         torch.testing.assert_close(received[0], x.flatten(1, 2))
-        self.assertEqual(shape, (2, 3))
-        self.assertEqual(tokens.shape, (2, 6, 8))
+        self.assertEqual(shape, (1, 2))
+        self.assertEqual(tokens.shape, (2, 2, 8))
         self.assertEqual(skips[0].shape, (2, 2, 16, 24))
         with torch.no_grad():
             _, direct_tokens, _ = encoder(x[:, 0])

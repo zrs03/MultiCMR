@@ -47,10 +47,10 @@ def collect_files(root, source, suffix, kind):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data-root', default='rawdata/CINE_MULTI')
-    parser.add_argument('--output-yaml', default='preprocess/matched_sax_context.yaml')
-    parser.add_argument('--output-dir', default='preprocess/processed_sax_context')
-    parser.add_argument('--lax-size', nargs=3, type=int, default=(5, 128, 128), metavar=('K', 'H', 'W'))
-    parser.add_argument('--sax-size', nargs=3, type=int, default=(5, 128, 128), metavar=('K', 'H', 'W'))
+    parser.add_argument('--output-yaml', default='preprocess/matched_mednext256.yaml')
+    parser.add_argument('--output-dir', default='preprocess/processed_mednext256')
+    parser.add_argument('--lax-size', nargs=3, type=int, default=(5, 256, 256), metavar=('K', 'H', 'W'))
+    parser.add_argument('--sax-size', nargs=3, type=int, default=(5, 256, 256), metavar=('K', 'H', 'W'))
     parser.add_argument('--sax-phase-info', default=None, help='Explicit common phase-table override; default uses per-split JSON under data-root')
     for split in SPLITS:
         parser.add_argument(f'--sax-phase-info-{split}', default=None, help='Optional split-specific phase table')
@@ -165,7 +165,7 @@ def main():
         splits[split] = records
         case_splits[split] = case_records
     output = {'dataset_info': {
-        'schema': 'sax_context_v2', 'window_size': sizes['2ch'][0],
+        'schema': 'sax_context_v3', 'spatial_transform': 'center_square_pad_resize', 'window_size': sizes['2ch'][0],
         'pairing': 'nearest_normalized_position', 'padding': {'lax': 'edge', 'sa': 'reflect'}, 'sax_flat_order': 'slice_phase',
         'data_root': str(root), 'source_order': list(SOURCE_FOLDERS),
         'num_classes_by_source': {'2ch': 3, '4ch': 6, 'sa': 4},

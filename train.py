@@ -160,8 +160,8 @@ def run_one_epoch(
 
 def main():
     parser = argparse.ArgumentParser(description="Train center-window LAX + 2.5D SAX context with masked token fusion")
-    parser.add_argument("--split-yaml", type=str, default="preprocess/matched_sax_context.yaml", help="Path to preprocessed split YAML")
-    parser.add_argument("--output-dir", type=str, default="checkpoints_sax_context", help="Directory to save checkpoints and logs")
+    parser.add_argument("--split-yaml", type=str, default="preprocess/matched_mednext256.yaml", help="Path to preprocessed split YAML")
+    parser.add_argument("--output-dir", type=str, default="checkpoints_mednext256", help="Directory to save checkpoints and logs")
     parser.add_argument("--source-order", nargs="+", default=None, help="List of sequence sources (defaults to YAML or [2ch 4ch sa])")
     parser.add_argument(
         "--num-classes-json",
@@ -169,8 +169,8 @@ def main():
         default=None,
         help="JSON string specifying number of classes per source (defaults to YAML)",
     )
-    parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH K H W (default 5 128 128 or YAML)')
-    parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX K H W (K must be 5; default 5 128 128)')
+    parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH K H W (default 5 256 256 or YAML)')
+    parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX K H W (K must be 5; default 5 256 256)')
     parser.add_argument('--base', type=int, default=32)
     parser.add_argument('--dim', type=int, default=128)
     parser.add_argument('--heads', type=int, default=4)
@@ -286,7 +286,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a SAX spatiotemporal 2.5D checkpoint (v19 joint attention); older checkpoints have incompatible model/optimizer parameters')
+            raise ValueError('Resume requires a SAX spatiotemporal 2.5D checkpoint (v20 MedNeXt-M); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):

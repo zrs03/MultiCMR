@@ -4,8 +4,8 @@ Compatible with train.py's load_cases_from_yaml / MultiSourceNiftiDataset3D
 and MMFormerAnatomy(x, modality_mask) interface.
 
 Example:
-  python test.py --split-yaml preprocess/matched_sax_context.yaml \
-    --checkpoint checkpoints_sax_context/best_model_3d_multihead.pth --split test
+  python test.py --split-yaml preprocess/matched_mednext256.yaml \
+    --checkpoint checkpoints_mednext256/best_model_3d_multihead.pth --split test
 
 LAX enters as centered temporal windows; outputs are reconstructed to native frame counts. Exports use model space: LAX [H,W,1,T] and SAX [H,W,D].
 """
@@ -135,7 +135,7 @@ def make_model(config, order, classes, device):
 
 def main():
     pa = argparse.ArgumentParser(description='YAML test/val evaluation for multi-view MMFormerAnatomy')
-    pa.add_argument('--split-yaml', default='preprocess/matched_sax_context.yaml')
+    pa.add_argument('--split-yaml', default='preprocess/matched_mednext256.yaml')
     pa.add_argument('--split', choices=['train','val','test'], default='val')
     pa.add_argument('--checkpoint', required=True)
     pa.add_argument('--output-dir', default='results_mmformer')
@@ -188,7 +188,7 @@ def main():
         sizes['sa'] = args.sax_size
     sizes = validate_output_sizes(sizes)
     if checkpoint.get('architecture') != ARCHITECTURE:
-        raise ValueError('Checkpoint is not a SAX spatiotemporal 2.5D model (v19 joint attention). Use a checkpoint trained with the current architecture.')
+        raise ValueError('Checkpoint is not a SAX spatiotemporal 2.5D model (v20 MedNeXt-M). Use a checkpoint trained with the current architecture.')
     cfg = dict(checkpoint['model_config'])
     if any(sizes[v][0] != cfg['temporal_size'] for v in VIEWS[:2]):
         raise ValueError('Window size differs between checkpoint and requested preprocessing')
@@ -266,6 +266,13 @@ def main():
                             array = array[:, :, None, :]  # NIfTI time is dimension four.
                         nib.save(nib.Nifti1Image(array, np.eye(4)),
                                  str(folder / f'{stem}_model_space.nii.gz'))
+                        from preprocess.processing import restore_native_labels
+                        native = restore_native_labels(pred, item['original_shapes'][view]).numpy().astype(np.uint8)
+                        native = np.moveaxis(native, 0, -1)
+                        if len(item['original_shapes'][view]) == 4:
+                            native = native[:, :, None, :]
+                        nib.save(nib.Nifti1Image(native, item['affines'][view]),
+                                 str(folder / f'{stem}_native.nii.gz'))
                     vis_key = (scenario, view)
                     if gt is not None and vis_count[vis_key] < args.vis_per_source:
                         visualize(images[view][0,0].cpu().numpy(), gt.numpy(), pred.numpy(),

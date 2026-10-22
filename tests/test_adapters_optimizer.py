@@ -29,12 +29,12 @@ class AdapterOptimizerTests(unittest.TestCase):
         self.assertEqual(set(adapters), {'2ch', '4ch'})
         self.assertEqual(len(model.decoder.spatial_adapters), 0)
         params = [m.pointwise.weight for modules in adapters.values() for m in modules]
-        self.assertEqual(len({id(p) for p in params}), 6)
+        self.assertEqual(len({id(p) for p in params}), 8)
         with torch.no_grad():
-            adapters['2ch'][2].pointwise.bias.fill_(1.)
+            adapters['2ch'][3].pointwise.bias.fill_(1.)
         x = torch.randn(1, 2, 9, 11)
-        torch.testing.assert_close(adapters['2ch'][2](x), x + 1)
-        torch.testing.assert_close(adapters['4ch'][2](x), x)
+        torch.testing.assert_close(adapters['2ch'][3](x), x + 1)
+        torch.testing.assert_close(adapters['4ch'][3](x), x)
 
     def test_adamw_groups_and_resume(self):
         model = MMFormerAnatomy(base=2, dim=8, heads=2)
@@ -42,7 +42,7 @@ class AdapterOptimizerTests(unittest.TestCase):
         self.assertIsInstance(optimizer, torch.optim.AdamW)
         groups = {id(p): g['weight_decay'] for g in optimizer.param_groups for p in g['params']}
         self.assertEqual(len(groups), len(list(model.parameters())))
-        self.assertEqual(groups[id(model.encoders['2ch'].c1.conv[0].weight)], .001)
+        self.assertEqual(groups[id(model.encoders['2ch'].backbone.stem.weight)], .001)
         self.assertEqual(groups[id(model.inter.lax_stage.anatomy_reads.attn.in_proj_weight)], .001)
         self.assertEqual(groups[id(model.inter.anatomy_tokens)], 0)
         self.assertEqual(groups[id(model.context_scale)], 0)

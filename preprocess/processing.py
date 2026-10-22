@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as F
 
 VIEWS = ('2ch', '4ch', 'sa')
-DEFAULT_OUTPUT_SIZES = {'2ch': (5, 128, 128), '4ch': (5, 128, 128),
-                        'sa': (5, 128, 128)}
+DEFAULT_OUTPUT_SIZES = {'2ch': (5, 256, 256), '4ch': (5, 256, 256),
+                        'sa': (5, 256, 256)}
 
 
 def validate_output_sizes(output_sizes=None):
@@ -59,6 +59,11 @@ def prepare_nifti(path, view, output_size, is_label=False):
         nonzero = array[np.abs(array) > 1e-8]
         if nonzero.size:
             array = (array - nonzero.mean()) / max(float(nonzero.std()), 1e-8)
+    # Center-pad before resizing so cardiac geometry is not stretched.
+    height, width = array.shape[-2:]
+    side = max(height, width)
+    top, left = (side - height) // 2, (side - width) // 2
+    array = np.pad(array, ((0, 0), (top, side-height-top), (left, side-width-left)))
     # Never interpolate the flattened slice/phase axis.
     tensor = torch.from_numpy(np.ascontiguousarray(array)).float()[:, None]
     kwargs = {} if is_label else {'align_corners': False}
@@ -130,3 +135,13 @@ def sax_context_indices(t, z, phases, slices):
                      z * phases + reflect_index(t + 1, phases),
                      reflect_index(z - 1, slices) * phases + t,
                      reflect_index(z + 1, slices) * phases + t], dtype=np.int64)
+
+
+def restore_native_labels(labels, original_shape):
+    """Undo square padding and resize; labels are [F,H,W], output [F,H0,W0]."""
+    height, width = map(int, original_shape[:2])
+    side = max(height, width)
+    top, left = (side-height)//2, (side-width)//2
+    tensor = torch.as_tensor(labels).float()[:, None]
+    square = F.interpolate(tensor, size=(side, side), mode='nearest')[:, 0]
+    return square[:, top:top+height, left:left+width].long()

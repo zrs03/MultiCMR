@@ -10,6 +10,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from .mednext import MedNeXtEncoder, MedNeXtDecoder
 VIEWS = ("2ch", "4ch", "sa")
 ANATOMY = ("background", "LV_myo", "LV_cav", "RV_cav", "RA", "LA")
 DEFAULT_LABEL_MAP = {"2ch": (0, 1, 2), "4ch": (0, 1, 2, 3, 4, 5), "sa": (0, 1, 2, 3)}
@@ -20,20 +21,6 @@ def norm(c: int) -> nn.Module:
         if c % g == 0:
             return nn.GroupNorm(g, c)
     return nn.GroupNorm(1, c)
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, cin: int, cout: int, stride: int = 1, spatial_dims: int = 3):
-        super().__init__()
-        conv = nn.Conv2d if spatial_dims == 2 else nn.Conv3d
-        self.conv = nn.Sequential(
-            conv(cin, cout, 3, stride, 1, bias=False), norm(cout), nn.ReLU(inplace=True),
-            conv(cout, cout, 3, 1, 1, bias=False), norm(cout),
-        )
-        self.skip = nn.Identity() if cin == cout and stride == 1 else conv(cin, cout, 1, stride)
-        self.relu = nn.ReLU(inplace=True)
-    def forward(self, x: Tensor) -> Tensor:
-        return self.relu(self.conv(x) + self.skip(x))
 
 
 class TransformerBlock(nn.Module):
@@ -87,82 +74,34 @@ class TransformerBlock(nn.Module):
         return x + self.mlp(self.n2(x))
 
 
-class HybridViewEncoder(nn.Module):
-    def __init__(self, in_channels: int, base: int, dim: int,
-                 token_grid: Tuple[int, ...], intra_layers: int, heads: int,
-                 spatial_dims: int = 3):
+class CineViewEncoder(nn.Module):
+    """Five context channels -> complete 2D MedNeXt-M -> spatial tokens."""
+    def __init__(self, in_channels, base, dim, token_grid, intra_layers, heads, temporal_size=5):
         super().__init__()
-        self.spatial_dims = spatial_dims
-        conv = nn.Conv2d if spatial_dims == 2 else nn.Conv3d
-        self.c1 = ConvBlock(in_channels, base, spatial_dims=spatial_dims)
-        self.c2 = ConvBlock(base, base * 2, 2, spatial_dims)
-        self.c3 = ConvBlock(base * 2, base * 4, 2, spatial_dims)
-        self.c4 = ConvBlock(base * 4, dim, 2, spatial_dims)
-        self.patch_embed = conv(dim, dim, kernel_size=1, stride=1)
-        self.token_pos = nn.Parameter(torch.randn(1, dim, *token_grid) * .02)
+        if not isinstance(temporal_size, int) or temporal_size < 1 or temporal_size % 2 == 0:
+            raise ValueError('temporal_size must be a positive odd integer')
+        self.in_channels, self.temporal_size = in_channels, temporal_size
+        self.backbone = MedNeXtEncoder(in_channels * temporal_size, base)
+        self.patch_embed = nn.Conv2d(base * 16, dim, 1)
+        self.token_pos = nn.Parameter(torch.randn(1, dim, *token_grid[-2:]) * .02)
         self.intra = nn.ModuleList([TransformerBlock(dim, heads) for _ in range(intra_layers)])
         self.token_norm = nn.LayerNorm(dim)
-    def forward(self, x: Tensor):
-        s1 = self.c1(x)
-        s2 = self.c2(s1)
-        s3 = self.c3(s2)
-        b = self.c4(s3)
-        # Preserve every CNN bottleneck position as one spatial token.
-        patch_map = self.patch_embed(b)
-        token_shape = patch_map.shape[2:]
-        pos = F.interpolate(self.token_pos, size=token_shape,
-                            mode="bilinear" if self.spatial_dims == 2 else "trilinear", align_corners=False)
-        tokens = patch_map.flatten(2).transpose(1, 2) + pos.flatten(2).transpose(1, 2)
-        for layer in self.intra:
-            tokens = layer(tokens)
-        return (s1, s2, s3, b), self.token_norm(tokens), token_shape
 
-
-class CineViewEncoder(HybridViewEncoder):
-    """Fuse the centered temporal window as channels in the first 2D convolution."""
-    def __init__(self, in_channels, base, dim, token_grid, intra_layers, heads,
-                 temporal_size=5):
-        if not isinstance(temporal_size, int) or (temporal_size < 1 or temporal_size % 2 == 0):
-            raise ValueError('temporal_size must be a positive odd integer')
-        super().__init__(in_channels * temporal_size, base, dim, token_grid[-2:],
-                         intra_layers, heads, spatial_dims=2)
-        self.in_channels = in_channels
-        self.temporal_size = temporal_size
-
-    def forward(self, x: Tensor):
+    def forward(self, x):
         if x.ndim == 5:
             if x.shape[1:3] != (self.in_channels, self.temporal_size):
-                raise ValueError(f'Cine expects C={self.in_channels}, T={self.temporal_size}; '
-                                 f'got {tuple(x.shape)}')
+                raise ValueError(f'Cine expects C={self.in_channels}, T={self.temporal_size}; got {tuple(x.shape)}')
             x = x.flatten(1, 2)
-        elif x.ndim != 4 or x.shape[1] != self.in_channels * self.temporal_size:
-            raise ValueError(f'Cine expects [B,{self.in_channels * self.temporal_size},H,W] '
-                             'or [B,C,T,H,W]')
-        return super().forward(x)
-
-
-class UpFuse(nn.Module):
-    def __init__(self, cin: int, cskip: int, cout: int, spatial_dims: int = 3):
-        super().__init__()
-        self.mode = "bilinear" if spatial_dims == 2 else "trilinear"
-        self.fuse = ConvBlock(cin + cskip, cout, spatial_dims=spatial_dims)
-    def forward(self, x: Tensor, skip: Tensor) -> Tensor:
-        x = F.interpolate(x, size=skip.shape[2:], mode=self.mode, align_corners=False)
-        return self.fuse(torch.cat((x, skip), dim=1))
-
-
-class ProgressiveDecoder(nn.Module):
-    def __init__(self, base: int, dim: int, spatial_dims: int = 3):
-        super().__init__()
-        self.d3 = UpFuse(dim, base * 4, base * 4, spatial_dims)
-        self.d2 = UpFuse(base * 4, base * 2, base * 2, spatial_dims)
-        self.d1 = UpFuse(base * 2, base, base, spatial_dims)
-    def forward(self, skips: Sequence[Tensor]):
-        s1, s2, s3, bottleneck = skips
-        d3 = self.d3(bottleneck, s3)
-        d2 = self.d2(d3, s2)
-        d1 = self.d1(d2, s1)
-        return d1
+        if x.ndim != 4 or x.shape[1] != self.in_channels * self.temporal_size:
+            raise ValueError('Cine expects [B,C*K,H,W] or [B,C,K,H,W]')
+        features = self.backbone(x)
+        patches = self.patch_embed(features[-1])
+        shape = patches.shape[-2:]
+        pos = F.interpolate(self.token_pos, size=shape, mode='bilinear', align_corners=False)
+        tokens = (patches + pos).flatten(2).transpose(1, 2)
+        for layer in self.intra:
+            tokens = layer(tokens)
+        return features, self.token_norm(tokens), shape
 
 
 class CrossAttentionBlock(nn.Module):
@@ -326,35 +265,28 @@ class ViewSpatialAdapter(nn.Module):
         return feature + residual
 
 
-class AnatomyAwareProgressiveDecoder(nn.Module):
-    def __init__(self, base: int, dim: int, view_token_counts: Mapping[str, int],
-                 spatial_dims: int = 3):
-        super().__init__()
-        self.d3 = UpFuse(dim, base * 4, base * 4, spatial_dims)
-        self.d2 = UpFuse(base * 4, base * 2, base * 2, spatial_dims)
-        self.d1 = UpFuse(base * 2, base, base, spatial_dims)
-        # Convolutions can be shared across views, but FiLM generators are not.
-        self.a3 = nn.ModuleDict({v: AnatomyFiLM(base * 4, dim, n) for v, n in view_token_counts.items()})
-        self.a2 = nn.ModuleDict({v: AnatomyFiLM(base * 2, dim, n) for v, n in view_token_counts.items()})
-        self.a1 = nn.ModuleDict({v: AnatomyFiLM(base, dim, n) for v, n in view_token_counts.items()})
-        # LAX shares the upsampling convolutions; spatial adapters are independent.
+class AnatomyAwareProgressiveDecoder(MedNeXtDecoder):
+    """Four MedNeXt decoding stages, each followed by per-view FiLM."""
+    def __init__(self, base, dim, view_token_counts):
+        super().__init__(base)
+        for scale in (1,2,3,4):
+            channels = base * 2**(scale-1)
+            setattr(self, f'a{scale}', nn.ModuleDict({
+                v: AnatomyFiLM(channels, dim, n) for v,n in view_token_counts.items()}))
         self.spatial_adapters = nn.ModuleDict({
-            v: nn.ModuleList([ViewSpatialAdapter(c) for c in (base * 4, base * 2, base)])
-            for v in view_token_counts if spatial_dims == 2 and v != 'sa'
-        })
+            v: nn.ModuleList([ViewSpatialAdapter(base * m) for m in (8,4,2,1)])
+            for v in view_token_counts if v != 'sa'})
 
-    def forward(self, skips: Sequence[Tensor], anatomy: Tensor, availability: Tensor, view: str):
-        s1, s2, s3, bottleneck = skips
-        d3 = self.a3[view](self.d3(bottleneck, s3), anatomy, availability)
-        if view in self.spatial_adapters:
-            d3 = self.spatial_adapters[view][0](d3)
-        d2 = self.a2[view](self.d2(d3, s2), anatomy, availability)
-        if view in self.spatial_adapters:
-            d2 = self.spatial_adapters[view][1](d2)
-        d1 = self.a1[view](self.d1(d2, s1), anatomy, availability)
-        if view in self.spatial_adapters:
-            d1 = self.spatial_adapters[view][2](d1)
-        return d1, d2
+    def forward(self, skips, anatomy, availability, view):
+        x = skips[-1]
+        decoded = []
+        for i, skip in enumerate(reversed(skips[:-1])):
+            x = self.decode_stage(i, x, skip)
+            x = getattr(self, f'a{4-i}')[view](x, anatomy, availability)
+            if view in self.spatial_adapters:
+                x = self.spatial_adapters[view][i](x)
+            decoded.append(x)
+        return decoded[-1], decoded[-2]
 
 
 class MMFormerAnatomy(nn.Module):
@@ -400,11 +332,12 @@ class MMFormerAnatomy(nn.Module):
         self.inter = TwoStageAnatomyTransformer(
             dim, heads, torch.stack([getattr(self, f'anatomy_available_{v}') for v in VIEWS]),
             inter_layers, token_drop_rate=token_drop_rate)
+        self.context_projection = nn.ModuleDict({v: nn.Conv2d(dim, base * 16, 1) for v in VIEWS})
         self.context_scale = nn.Parameter(torch.tensor(.1))
         token_counts = {v: int(getattr(self, f'anatomy_available_{v}').sum()) for v in VIEWS}
-        self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']}, spatial_dims=2)
+        self.decoder = AnatomyAwareProgressiveDecoder(base, dim, {'sa': token_counts['sa']})
         self.decoder_2d = AnatomyAwareProgressiveDecoder(
-            base, dim, {v: token_counts[v] for v in VIEWS[:2]}, spatial_dims=2)
+            base, dim, {v: token_counts[v] for v in VIEWS[:2]})
         # LAX heads predict only the center frame.
         output_channels = dict(self.num_classes_by_source)
         self.heads = nn.ModuleDict({v: nn.Conv2d(base, output_channels[v], 1)
@@ -412,8 +345,8 @@ class MMFormerAnatomy(nn.Module):
         self.deep_heads = nn.ModuleDict({
             v: nn.Conv2d(base * 2, output_channels[v], 1)
             for v in VIEWS})
-        self.aux_decoder = ProgressiveDecoder(base, dim, spatial_dims=2)
-        self.aux_decoder_2d = ProgressiveDecoder(base, dim, spatial_dims=2)
+        self.aux_decoder = MedNeXtDecoder(base)
+        self.aux_decoder_2d = MedNeXtDecoder(base)
         self.aux_heads = nn.ModuleDict({v: nn.Conv2d(base, output_channels[v], 1)
                                        for v in VIEWS})
     def forward(self, x: Mapping[str, Tensor], modality_mask: Tensor) -> Dict:
@@ -448,11 +381,11 @@ class MMFormerAnatomy(nn.Module):
         if not present.any(dim=1).all():
             raise ValueError('Each sample must have at least one available view')
         skip_maps, view_tokens, patch_shapes = {}, {}, {}
-        chans = (self.base, self.base * 2, self.base * 4, self.dim)
+        chans = tuple(self.base * 2**i for i in range(5))
         for i, view in enumerate(VIEWS):
             image = x[view]
             shapes = [tuple(image.shape[-2:])]
-            for _ in range(3):
+            for _ in range(4):
                 previous = shapes[-1]
                 shapes.append(tuple((n + 1) // 2 for n in previous))
             token_shape = shapes[-1]
@@ -490,7 +423,7 @@ class MMFormerAnatomy(nn.Module):
             patch = fused[view].index_select(0, indices).transpose(1, 2)
             patch = patch.reshape(indices.numel(), self.dim, *patch_shapes[view])
             patch = F.interpolate(patch, size=sk[-1].shape[2:], mode=mode, align_corners=False)
-            sk[-1] = sk[-1] + self.context_scale * patch
+            sk[-1] = sk[-1] + self.context_scale * self.context_projection[view](patch)
             anatomy = anatomy_tokens.index_select(0, indices)
             d1, d2 = decoder(sk, anatomy,
                                   getattr(self, f'anatomy_available_{view}'), view)

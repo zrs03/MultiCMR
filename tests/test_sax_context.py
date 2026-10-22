@@ -32,7 +32,7 @@ class SAXContextTests(unittest.TestCase):
             labels, _, original = prepare_nifti(path, 'sa', (5,16,24), is_label=True)
             self.assertEqual(labels.shape, (12,16,24))
             self.assertEqual(original, (7,9,12))
-            np.testing.assert_array_equal(labels[:,0,0], np.arange(12))
+            np.testing.assert_array_equal(labels[:,8,12], np.arange(12))
         for phases in (None, 0, -1, 2.5, True):
             with self.assertRaises(ValueError): validate_sax_geometry(12, phases)
         with self.assertRaises(ValueError): validate_sax_geometry(13, 4)
@@ -80,7 +80,7 @@ class SAXContextTests(unittest.TestCase):
         x = {v: torch.randn(1,1,5,16,16, requires_grad=True) for v in ('2ch','4ch','sa')}
         result = model(x, torch.tensor([[0,0,1]]))
         self.assertEqual(result['logits']['sa'].shape, (1,4,16,16))
-        self.assertEqual(result['patch_shapes']['sa'], (2,2))
+        self.assertEqual(result['patch_shapes']['sa'], (1,1))
         result['logits']['sa'].square().mean().backward()
         for channel in range(5):
             self.assertGreater(x['sa'].grad[:,:,channel].abs().sum().item(), 0)
