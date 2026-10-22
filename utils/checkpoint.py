@@ -6,7 +6,7 @@ import warnings
 import numpy as np
 import torch
 
-ARCHITECTURE = 'sax_spatiotemporal_25d_v18'
+ARCHITECTURE = 'sax_spatiotemporal_joint_v19'
 
 
 def capture_rng_state():

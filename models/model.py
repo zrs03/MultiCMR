@@ -208,7 +208,7 @@ class AnatomyCrossStage(nn.Module):
 
 
 class TwoStageAnatomyTransformer(nn.Module):
-    """LAX/anatomy cross-attention followed by SAX/anatomy cross-attention."""
+    """Two routed cross-attention stages followed by one joint self-attention block."""
     def __init__(self, dim: int, heads: int, view_anatomy: Tensor, layers: int = 2,
                  dropout: float = .1, token_drop_rate: float = .05):
         super().__init__()
@@ -222,6 +222,7 @@ class TwoStageAnatomyTransformer(nn.Module):
         self.lax_patch_attention = TransformerBlock(dim, heads, dropout)
         self.lax_stage = AnatomyCrossStage(dim, heads, dropout)
         self.sax_stage = AnatomyCrossStage(dim, heads, dropout)
+        self.joint_attention = TransformerBlock(dim, heads, dropout)
         self.norm = nn.LayerNorm(dim)
 
     def mask_anatomy_reads(self, edges, present):
@@ -269,7 +270,18 @@ class TwoStageAnatomyTransformer(nn.Module):
         lax, anatomy = self.lax_stage(lax, anatomy,
                                       torch.cat(edges[:2], 1), torch.cat(read_edges[:2], 1))
         sax, anatomy = self.sax_stage(patches[2], anatomy, edges[2], read_edges[2])
-        updated = (*lax.split([p.shape[1] for p in patches[:2]], dim=1), sax)
+        # Stage three: all present spatial tokens and five anatomy tokens interact.
+        # Anatomy keys remain valid even for single-view inputs. Missing patch
+        # queries are discarded below and cannot serve as keys or values.
+        joint_missing = torch.cat([
+            ~present[:, i:i+1].expand(-1, p.shape[1])
+            for i, p in enumerate(patches)
+        ] + [torch.zeros(batch, 5, dtype=torch.bool, device=present.device)], dim=1)
+        joint = torch.cat((lax, sax, anatomy), dim=1)
+        joint = joint.masked_fill(joint_missing[:, :, None], 0)
+        joint = self.joint_attention(joint, key_padding_mask=joint_missing)
+        parts = joint.split([p.shape[1] for p in patches] + [5], dim=1)
+        updated, anatomy = parts[:3], parts[3]
         views_out = {v: self.norm(updated[i]).masked_fill(~present[:, i, None, None], 0)
                      for i, v in enumerate(VIEWS)}
         return views_out, self.norm(anatomy)
@@ -350,7 +362,7 @@ class MMFormerAnatomy(nn.Module):
     def __init__(self, in_channels: int = 1,
                  num_classes_by_source: Optional[Dict[str, int]] = None,
                  source_order: Sequence[str] = VIEWS,
-                 base: int = 16, dim: int = 128, heads: int = 4,
+                 base: int = 32, dim: int = 128, heads: int = 4,
                  token_grid: Tuple[int, int, int] = (2, 4, 4),
                  intra_layers: int = 1, inter_layers: int = 2,
                  label_to_anatomy: Optional[Mapping[str, Sequence[int]]] = None,

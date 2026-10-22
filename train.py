@@ -171,14 +171,14 @@ def main():
     )
     parser.add_argument('--lax-size', nargs=3, type=int, default=None, help='2CH/4CH K H W (default 5 128 128 or YAML)')
     parser.add_argument('--sax-size', nargs=3, type=int, default=None, help='SAX K H W (K must be 5; default 5 128 128)')
-    parser.add_argument('--base', type=int, default=16)
+    parser.add_argument('--base', type=int, default=32)
     parser.add_argument('--dim', type=int, default=128)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--token-grid', nargs=3, type=int, default=(2, 4, 4))
     parser.add_argument('--intra-layers', type=int, default=1)
     parser.add_argument('--token-drop-rate', type=float, default=.05,
                         help='Training anatomy-read token masking: default 0.05 for fresh and resumed training; 0 disables')
-    parser.add_argument('--inter-layers', type=int, default=2, help='Must be 2: LAX/anatomy cross-attention, then SAX/anatomy cross-attention')
+    parser.add_argument('--inter-layers', type=int, default=2, help='Must be 2: LAX/anatomy cross-attention, then SAX/anatomy cross-attention; followed by one fixed joint self-attention block')
     parser.add_argument('--deep-weight', type=float, default=.1, help='Single-scale d2 Dice+CE weight; 0 disables')
     parser.add_argument('--aux-weight', type=float, default=.2)
     parser.add_argument('--windows-per-patient', type=int, default=4, help='Max paired context samples per patient per epoch (one SAX slice/phase each); 0 uses all')
@@ -286,7 +286,7 @@ def main():
     if args.resume:
         resume_checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         if resume_checkpoint.get('architecture') != ARCHITECTURE:
-            raise ValueError('Resume requires a SAX spatiotemporal 2.5D checkpoint (v18); older checkpoints have incompatible model/optimizer parameters')
+            raise ValueError('Resume requires a SAX spatiotemporal 2.5D checkpoint (v19 joint attention); older checkpoints have incompatible model/optimizer parameters')
         if 'optimizer' in resume_checkpoint and resume_checkpoint.get('optimizer_type') != 'AdamW':
             raise ValueError('Resume checkpoint optimizer is not AdamW; full optimizer restoration is incompatible')
         if list(resume_checkpoint['source_order']) != list(source_order):

@@ -1,6 +1,6 @@
 # MultiCMR：SAX 时空邻域输入
 
-当前版本 `sax_spatiotemporal_25d_v18` 基于原有残差 CNN、两阶段解剖交互与 FiLM，采用 CardioState 的 SAX 输入组织。不是完整复现 CardioState：保留原 backbone、跨视图交互和损失；2CH/4CH 仍使用原五帧时间窗。
+当前版本 `sax_spatiotemporal_joint_v19` 基于原有残差 CNN、两阶段解剖交互与 FiLM，采用 CardioState 的 SAX 输入组织。不是完整复现 CardioState：保留原 backbone、跨视图交互和损失；2CH/4CH 仍使用原五帧时间窗。
 
 ## 输入和输出
 
@@ -18,9 +18,11 @@ I(t,z), I(t-1,z), I(t+1,z), I(t,z-1), I(t,z+1)
 
 输入 `[B,1,5,H,W]` 在第一层二维卷积前合并为 `[B,5,H,W]`。SAX 使用独立的二维 encoder、主 decoder 和辅助 decoder，三个分割头均为二维。长轴 encoder 独立，主/辅助 decoder 仍在两长轴视图之间共享。
 
+默认 `base=32`，`dim=128`、`heads=4` 不变；encoder 通道为 32→64→128→128。`inter_layers=2` 仍表示前两个解剖路由阶段，额外联合层固定一层。新架构需重新训练，旧版 checkpoint 不能直接 resume；预处理缓存可复用。
+
 三次空间下采样与 patch size=1 不变。128 输入时，各视图均有 `16×16=256` 个空间 patch tokens，加五个解剖 tokens 共 **773**。五个邻域图像是通道，不是五倍 token。
 
-2CH/4CH patches 先直接交互，再与对应解剖 tokens 双向交互；SAX 与其关联的三个解剖 tokens 双向交互。最终解剖 tokens 经 FiLM 调制三视图主 decoder。长轴独立空间适配层、模态掩码、随机 token key/value 屏蔽保持不变。
+2CH/4CH patches 先直接交互，再与对应解剖 tokens 双向交互；SAX 与其关联的三个解剖 tokens 双向交互。随后新增一层联合 self-attention，将 2CH、4CH、SAX patches 和五个解剖 tokens 拼接，允许所有存在视图直接交互；缺失视图 patches 不作为有效 Key/Value，输出仍屏蔽。位置编码和视图编码保留。第三阶段更新后的解剖 tokens 经 FiLM 调制三视图主 decoder。长轴独立空间适配层、模态掩码、随机 token key/value 屏蔽保持不变。
 
 ## SAX 排列与预处理
 

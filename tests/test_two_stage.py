@@ -28,10 +28,10 @@ class TwoStageTests(unittest.TestCase):
         self.assertGreater((first[:, :2] - second[:, :2]).abs().max().item(), 1e-6)
         changed = {**tokens, 'sa': torch.randn_like(tokens['sa']) * 4}
         other_views, other = net(changed, present)
-        # SAX is processed later: no backward patch update to LAX in this block.
-        torch.testing.assert_close(first_views['2ch'], other_views['2ch'])
-        torch.testing.assert_close(first_views['4ch'], other_views['4ch'])
-        torch.testing.assert_close(first[:, 3:], other[:, 3:])
+        # The final joint stage sends SAX evidence back to both LAX patch sets.
+        for view in ('2ch', '4ch'):
+            self.assertGreater((first_views[view] - other_views[view]).abs().sum().item(), 1e-6)
+        self.assertGreater((first[:, 3:] - other[:, 3:]).abs().sum().item(), 1e-6)
         self.assertGreater((first[:, :3]-other[:, :3]).abs().sum().item(), 0)
 
     def test_joint_lax_attention_is_bidirectional_and_excludes_sax(self):
